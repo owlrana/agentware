@@ -1,0 +1,58 @@
+#!/bin/bash
+# aw-knowledge-dir — resolve the external knowledge directory for shell consumers.
+#
+# Prints the absolute knowledge-dir path on stdout and exits 0 when configured;
+# prints nothing and exits 1 when unconfigured. Pure bash (no python startup),
+# so it is cheap enough to call from agent spawn hooks on every spawn.
+#
+# Resolution precedence:
+#   1. $AGENTWARE_KNOWLEDGE_DIR environment variable
+#   2. AGENTWARE_KNOWLEDGE_DIR=... in ~/.agentware/config.env
+#   3. (legacy) the same line in <repo>/.agentware/config.env
+
+set -e
+
+# Repo root = parent of the dir holding this script (resolves symlinks-light).
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+HOME_CONFIG="$HOME/.agentware/config.env"
+REPO_CONFIG="$REPO_ROOT/.agentware/config.env"
+
+expand_tilde() {
+  # Expand a leading ~ to $HOME; leave other paths untouched.
+  case "$1" in
+    "~") printf '%s\n' "$HOME" ;;
+    "~/"*) printf '%s\n' "$HOME/${1#\~/}" ;;
+    *) printf '%s\n' "$1" ;;
+  esac
+}
+
+read_config() {
+  # Echo the knowledge dir from a config file, or nothing. $1 = file path.
+  local file="$1" line val
+  [[ -f "$file" ]] || return 1
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ "$line" =~ ^[[:space:]]*# ]] && continue
+    if [[ "$line" == AGENTWARE_KNOWLEDGE_DIR=* ]]; then
+      val="${line#AGENTWARE_KNOWLEDGE_DIR=}"
+      val="${val%\"}"; val="${val#\"}"
+      val="${val%\'}"; val="${val#\'}"
+      [[ -n "$val" ]] && { expand_tilde "$val"; return 0; }
+    fi
+  done < "$file"
+  return 1
+}
+
+resolve() {
+  if [[ -n "${AGENTWARE_KNOWLEDGE_DIR:-}" ]]; then
+    expand_tilde "$AGENTWARE_KNOWLEDGE_DIR"
+    return 0
+  fi
+  read_config "$HOME_CONFIG" && return 0
+  read_config "$REPO_CONFIG" && return 0
+  return 1
+}
+
+DIR="$(resolve)" || exit 1
+[[ -z "$DIR" ]] && exit 1
+printf '%s\n' "$DIR"

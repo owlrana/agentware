@@ -1,0 +1,34 @@
+# --- agentware: keep the repo pure steering, never commit anything personal ---
+
+# Local machine config: pins the EXTERNAL knowledge dir path (per-machine).
+# This is what keeps the clone generic — never commit it.
+.agentware/
+
+# Spawn / prompt logs written by the agent hooks.
+.agentware-logs/
+
+# Claude Code local settings overrides (machine-specific). settings.json IS tracked.
+.claude/settings.local.json
+
+# Per-feature work artifacts (plans/worklogs may reference project specifics).
+# The directory itself is tracked via .gitkeep so the loop has a home.
+docs/design/*
+!docs/design/.gitkeep
+
+# The external knowledge base lives OUTSIDE the repo by design and is never
+# inside the working tree — but guard against an accidental in-repo dir.
+/knowledge/
+
+# Python / tooling
+__pycache__/
+*.pyc
+.venv/
+
+# OS / editor noise
+*.log
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

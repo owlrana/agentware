@@ -1,0 +1,1289 @@
+#!/usr/bin/env python3
+"""agentware — deterministic CLI toolkit for an agentware workspace.
+
+The LLM decides WHAT to do; this toolkit does it correctly. It is the ONLY
+writer of structured data (the knowledge index.json, FEATURES.md, learning
+files).
+
+agentware ships ZERO personal data. The knowledge base lives at a user-chosen
+directory OUTSIDE this repo, resolved (in order) from:
+
+  1. the AGENTWARE_KNOWLEDGE_DIR environment variable, then
+  2. the AGENTWARE_KNOWLEDGE_DIR=... line in ~/.agentware/config.env, then
+  3. (legacy) the same line in <repo>/.agentware/config.env
+
+Run `scripts/agentware init --knowledge-dir <path>` once to create the
+directory structure, seed an empty index, and write the config file. Every
+other knowledge command resolves the directory automatically. All paths stored
+in the index are RELATIVE to the knowledge directory so the index stays
+portable.
+"""
+
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import sys
+
+# --- Repo + knowledge-dir resolution ----------------------------------------
+# Repo root = the parent of the scripts/ dir that holds this file. Computed from
+# __file__ so the toolkit works regardless of the caller's cwd.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+# The config pointer lives in the user's HOME by default so the orchestrator
+# package itself stays pristine (read-only) across projects. A repo-local config
+# is honoured as a legacy/override fallback. `init` always writes HOME_CONFIG.
+HOME_CONFIG = os.path.join(os.path.expanduser("~"), ".agentware", "config.env")
+REPO_CONFIG = os.path.join(REPO_ROOT, ".agentware", "config.env")
+CONFIG_PATHS = (HOME_CONFIG, REPO_CONFIG)
+CONFIG_KEY = "AGENTWARE_KNOWLEDGE_DIR"
+
+# Knowledge-dir-relative locations (joined with the resolved knowledge dir).
+INDEX_REL = "index.json"
+LEARNINGS_REL = "learnings"
+FEATURES_REL = "FEATURES.md"
+SENTINEL_REL = ".initialized"
+
+# Indexed knowledge categories scaffolded by `init` inside the knowledge dir.
+KNOWLEDGE_SUBDIRS = ("learnings", "projects", "configurations", "prompts",
+                     "references", "skills")
+
+# Non-indexed dirs `init` also scaffolds in the knowledge dir: per-feature work
+# artifacts (plans/worklogs/state) and append-only session logs. These hold the
+# operator's project work + audit trail OUTSIDE the orchestrator package so the
+# package stays read-only across projects.
+NON_INDEXED_DIRS = ("work", "logs", os.path.join("logs", "sessions"))
+
+# Single source of truth for knowledge categories. The index holds the USER's
+# knowledge only — framework artifacts (skills, steering, the toolkit) ship with
+# the repo and are documented in README/FEATURES, not in the per-user index.
+CATEGORIES = (
+    "learnings",
+    "projects",
+    "configurations",
+    "prompts",
+    "references",
+    "skills",
+)
+
+# Files that are intentionally NEVER indexed (structural / generated). `index
+# sync` must not report these as gaps, otherwise the report is pure noise.
+SYNC_EXCLUDE_BASENAMES = ("MAIN.md", "FEATURES.md", "README.md")
+
+# Maps a knowledge subdir to the canonical category + id prefix `index sync
+# --fix` assigns to a newly discovered file.
+SYNC_CATEGORY_RULES = (
+    ("learnings/", "learnings", "learn"),
+    ("projects/", "projects", "project"),
+    ("configurations/", "configurations", "config"),
+    ("prompts/", "prompts", "prompt"),
+    ("references/", "references", "ref"),
+    ("skills/", "skills", "skill"),
+)
+
+# --- Steering (Deterministic Steering Format) lint config --------------------
+# These operate on the IN-REPO always-loaded steering, which is framework and
+# ships with the clone — unrelated to the external knowledge dir.
+
+# Allowed directive verbs for Deterministic Steering Format (DSF-2).
+DSF_VERBS = ("MUST", "NEVER", "ALWAYS", "RUN", "ASK", "STOP", "READ", "IF")
+
+# Banned hedge words for always-loaded steering (DSF-5).
+DSF_BANNED_WORDS = (
+    "should", "try", "consider", "ideally", "generally",
+    "usually", "maybe", "prefer", "when possible", "as needed",
+)
+
+# Total character budget for always-loaded steering (DSF-budget).
+STEERING_CHAR_BUDGET = 15000
+
+# Always-loaded steering set under Claude Code: `CLAUDE.md` is auto-loaded and
+# imports `@AGENTS.md` plus the files in `steering/`. The linter lints all of
+# them so the always-on layer can never drift out of the Deterministic Steering
+# Format. (The `@`-import lines in CLAUDE.md are bare paths, not bullets, so they
+# are not treated as rules.)
+STEERING_EXPLICIT = ("CLAUDE.md", "AGENTS.md")
+STEERING_GLOB = os.path.join(REPO_ROOT, "steering", "*.md")
+
+# DSF-6: every rule bullet carries a stable rule ID like R-KB-01.
+DSF_RULE_ID_RE = re.compile(r"R-[A-Z]+-\d+")
+# A lintable rule line is a markdown bullet (`-` or `*`). Numbered lists,
+# headings, tables, blockquotes, code fences and prose are NOT rules.
+DSF_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+)$")
+
+# Required fields every index entry must carry.
+REQUIRED_FIELDS = ("id", "title", "category", "path", "tags", "summary")
+
+
+# --- Knowledge-dir resolution ------------------------------------------------
+def resolve_knowledge_dir():
+    """Resolve the knowledge directory, or return None if unconfigured.
+
+    Precedence: AGENTWARE_KNOWLEDGE_DIR env var, then the config.env file.
+    Always returns an absolute, user-expanded path.
+    """
+    env = os.environ.get(CONFIG_KEY)
+    if env and env.strip():
+        return os.path.abspath(os.path.expanduser(env.strip()))
+    for cfg in CONFIG_PATHS:
+        if not os.path.isfile(cfg):
+            continue
+        try:
+            with open(cfg, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.startswith("#") or "=" not in line:
+                        continue
+                    key, _, val = line.partition("=")
+                    if key.strip() == CONFIG_KEY:
+                        val = val.strip().strip('"').strip("'")
+                        if val:
+                            return os.path.abspath(os.path.expanduser(val))
+        except OSError:
+            continue
+    return None
+
+
+def require_knowledge_dir():
+    """Resolve the knowledge dir or print a uniform error and return None."""
+    kdir = resolve_knowledge_dir()
+    if not kdir:
+        sys.stderr.write(
+            "agentware: knowledge directory is not configured.\n"
+            "  Run: scripts/agentware init --knowledge-dir <path>\n"
+            "  Or set the AGENTWARE_KNOWLEDGE_DIR environment variable.\n")
+        return None
+    if not os.path.isdir(kdir):
+        sys.stderr.write(
+            "agentware: configured knowledge directory does not exist: %s\n"
+            "  Run: scripts/agentware init --knowledge-dir %s\n" % (kdir, kdir))
+        return None
+    return kdir
+
+
+def index_path(kdir):
+    return os.path.join(kdir, INDEX_REL)
+
+
+def features_path(kdir):
+    return os.path.join(kdir, FEATURES_REL)
+
+
+def learnings_dir(kdir):
+    return os.path.join(kdir, LEARNINGS_REL)
+
+
+# --- Shared index helpers ----------------------------------------------------
+def load_index(kdir):
+    """Load <kdir>/index.json. Returns (data, error)."""
+    path = index_path(kdir)
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return None, "index file not found: %s (run 'agentware init')" % path
+    except json.JSONDecodeError as exc:
+        return None, "invalid JSON in %s: %s" % (path, exc)
+    return data, None
+
+
+def save_index(kdir, data):
+    """Write <kdir>/index.json canonically (2-space indent, trailing newline)."""
+    with open(index_path(kdir), "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2, ensure_ascii=False)
+        f.write("\n")
+
+
+def _today():
+    import datetime
+    return datetime.date.today().isoformat()
+
+
+def _entry_key(entry):
+    return (entry.get("category") or "", entry.get("id") or "")
+
+
+def insert_entry_sorted(entries, entry):
+    """Insert `entry` at its (category, id) sorted slot (insertion-only)."""
+    key = _entry_key(entry)
+    for i, existing in enumerate(entries):
+        if _entry_key(existing) > key:
+            entries.insert(i, entry)
+            return
+    entries.append(entry)
+
+
+def add_tags_to_map(tags_map, entry_id, tag_list):
+    for t in tag_list:
+        bucket = tags_map.get(t)
+        if bucket is None:
+            tags_map[t] = [entry_id]
+        elif entry_id not in bucket:
+            bucket.append(entry_id)
+
+
+def remove_tags_from_map(tags_map, entry_id):
+    for t in list(tags_map.keys()):
+        bucket = tags_map.get(t)
+        if isinstance(bucket, list) and entry_id in bucket:
+            bucket[:] = [i for i in bucket if i != entry_id]
+            if not bucket:
+                del tags_map[t]
+
+
+def parse_tags(raw):
+    out = []
+    for part in (raw or "").split(","):
+        t = part.strip()
+        if t and t not in out:
+            out.append(t)
+    return out
+
+
+def validate_index(kdir, data):
+    """Return a list of error strings for the index data (empty == valid).
+
+    All entry paths are interpreted RELATIVE to the knowledge dir.
+    """
+    errors = []
+    if not isinstance(data, dict):
+        return ["index root is not a JSON object"]
+
+    entries = data.get("entries")
+    tags = data.get("tags")
+    if not isinstance(entries, list):
+        errors.append("'entries' is missing or not a list")
+        entries = []
+    if not isinstance(tags, dict):
+        errors.append("'tags' is missing or not an object")
+        tags = {}
+
+    seen_ids = {}
+    seen_paths = {}
+
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            errors.append("entry #%d is not an object" % i)
+            continue
+        eid = entry.get("id")
+        label = eid if eid else "#%d" % i
+
+        for field in REQUIRED_FIELDS:
+            if field not in entry:
+                errors.append("entry '%s' missing required field '%s'" % (label, field))
+
+        cat = entry.get("category")
+        if cat is not None and cat not in CATEGORIES:
+            errors.append("entry '%s' has invalid category '%s'" % (label, cat))
+
+        path = entry.get("path")
+        if path:
+            if not os.path.exists(os.path.join(kdir, path)):
+                errors.append("entry '%s' path does not exist: %s" % (label, path))
+            if path in seen_paths:
+                errors.append("duplicate path '%s' (entries '%s' and '%s')"
+                              % (path, seen_paths[path], label))
+            else:
+                seen_paths[path] = label
+
+        if eid:
+            if eid in seen_ids:
+                errors.append("duplicate id '%s'" % eid)
+            else:
+                seen_ids[eid] = entry
+
+        etags = entry.get("tags")
+        if etags is not None and not isinstance(etags, list):
+            errors.append("entry '%s' tags is not a list" % label)
+
+    # Tag map bidirectional consistency: entry.tags -> tags map.
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        eid = entry.get("id")
+        etags = entry.get("tags")
+        if not isinstance(etags, list):
+            continue
+        for t in etags:
+            ids = tags.get(t)
+            if not isinstance(ids, list) or eid not in ids:
+                errors.append("tag map missing id '%s' under tag '%s'" % (eid, t))
+
+    # Tag map bidirectional consistency: tags map -> entry.tags.
+    for t, ids in tags.items():
+        if not isinstance(ids, list):
+            errors.append("tag '%s' is not a list" % t)
+            continue
+        if len(ids) == 0:
+            errors.append("tag '%s' has an empty entry list" % t)
+        for eid in ids:
+            entry = seen_ids.get(eid)
+            if entry is None:
+                errors.append("tag '%s' references unknown id '%s'" % (t, eid))
+            elif t not in (entry.get("tags") or []):
+                errors.append("entry '%s' does not list tag '%s' (back-ref mismatch)"
+                              % (eid, t))
+
+    return errors
+
+
+def _do_add(kdir, data, eid, title, category, path, tag_list, summary, created=None):
+    """Shared add core. Validates BEFORE mutating; returns (entry, error)."""
+    entries = data.setdefault("entries", [])
+    tags_map = data.setdefault("tags", {})
+
+    if category not in CATEGORIES:
+        return None, "invalid category '%s' (allowed: %s)" % (
+            category, ", ".join(CATEGORIES))
+    if not os.path.exists(os.path.join(kdir, path)):
+        return None, "path does not exist (relative to knowledge dir): %s" % path
+    if any(e.get("id") == eid for e in entries):
+        return None, "duplicate id '%s'" % eid
+    if any(e.get("path") == path for e in entries):
+        return None, "path already indexed: %s" % path
+
+    entry = {
+        "id": eid,
+        "title": title,
+        "category": category,
+        "path": path,
+        "tags": tag_list,
+        "created": created or _today(),
+        "summary": summary,
+    }
+    insert_entry_sorted(entries, entry)
+    add_tags_to_map(tags_map, eid, tag_list)
+    return entry, None
+
+
+def indexed_paths(data):
+    return {e.get("path") for e in (data.get("entries") or [])
+            if isinstance(e, dict) and e.get("path")}
+
+
+def _is_sync_candidate(path):
+    """True if `path` (knowledge-dir-relative) is an indexable *.md gap."""
+    p = path.replace(os.sep, "/")
+    base = os.path.basename(p)
+    parts = p.split("/")
+    if base in SYNC_EXCLUDE_BASENAMES:
+        return False
+    if "templates" in parts:
+        return False
+    # Section roster `<section>/index.md` (exactly 2 parts) is a human roster.
+    if base == "index.md" and len(parts) == 2:
+        return False
+    return True
+
+
+def scan_unindexed(kdir, data):
+    """Return sorted unindexed indexable *.md files (knowledge-dir-relative)."""
+    have = indexed_paths(data)
+    found = []
+    for sub in KNOWLEDGE_SUBDIRS:
+        d = os.path.join(kdir, sub)
+        if not os.path.isdir(d):
+            continue
+        for root, _dirs, files in os.walk(d):
+            for fn in files:
+                if not fn.endswith(".md"):
+                    continue
+                rel = os.path.relpath(os.path.join(root, fn), kdir).replace(os.sep, "/")
+                if rel in have:
+                    continue
+                if _is_sync_candidate(rel):
+                    found.append(rel)
+    return sorted(set(found))
+
+
+def _infer_category(path):
+    p = path.replace(os.sep, "/")
+    for prefix, category, _id_prefix in SYNC_CATEGORY_RULES:
+        if p.startswith(prefix):
+            return category
+    return "references"
+
+
+def _suggest_id(path):
+    p = path.replace(os.sep, "/")
+    category = _infer_category(p)
+    id_prefix = "ref"
+    for prefix, cat, ip in SYNC_CATEGORY_RULES:
+        if cat == category:
+            id_prefix = ip
+            break
+    stem = p[:-3] if p.endswith(".md") else p
+    base = os.path.basename(stem)
+    if base in ("SKILL", "index"):
+        base = os.path.basename(os.path.dirname(stem))
+    slug = re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+    return "%s-%s" % (id_prefix, slug)
+
+
+def _suggest_title(path):
+    eid = _suggest_id(path)
+    parts = eid.split("-")[1:] or eid.split("-")
+    return " ".join(w.capitalize() for w in parts)
+
+
+# --- init / config -----------------------------------------------------------
+def _write_config(kdir):
+    """Write ~/.agentware/config.env pinning the knowledge dir.
+
+    Kept in HOME (not the repo) so the orchestrator package stays pristine.
+    """
+    os.makedirs(os.path.dirname(HOME_CONFIG), exist_ok=True)
+    with open(HOME_CONFIG, "w", encoding="utf-8") as f:
+        f.write("# agentware config — machine-specific, points at this operator's\n")
+        f.write("# EXTERNAL knowledge base so the orchestrator package stays read-only.\n")
+        f.write('%s=%s\n' % (CONFIG_KEY, kdir))
+
+
+def cmd_init(args):
+    """Scaffold the external knowledge dir + seed an empty index + write config.
+
+    Idempotent: re-running against an existing dir leaves entries intact and
+    only fills in any missing structure. Does NOT write the .initialized
+    sentinel — onboarding writes that after the interview.
+    """
+    kdir = os.path.abspath(os.path.expanduser(args.knowledge_dir))
+    as_json = getattr(args, "format", "text") == "json"
+
+    # KNOWLEDGE_SUBDIRS are indexed knowledge categories; NON_INDEXED_DIRS are
+    # the operator's work artifacts (plans/worklogs) and append-only logs that
+    # the orchestrator writes here INSTEAD of into the package.
+    created_dirs = []
+    for sub in ("",) + KNOWLEDGE_SUBDIRS + NON_INDEXED_DIRS:
+        d = os.path.join(kdir, sub) if sub else kdir
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+            created_dirs.append(d)
+
+    # Seed an empty valid index only if absent (never clobber real data).
+    ipath = index_path(kdir)
+    seeded = False
+    if not os.path.exists(ipath):
+        save_index(kdir, {"entries": [], "tags": {}})
+        seeded = True
+
+    # Drop a category roster placeholder so each subdir is browsable.
+    for sub in KNOWLEDGE_SUBDIRS:
+        roster = os.path.join(kdir, sub, "index.md")
+        if not os.path.exists(roster):
+            with open(roster, "w", encoding="utf-8") as f:
+                f.write("# %s\n\n_Index of %s. Entries are registered in "
+                        "`../index.json` via `scripts/agentware`._\n"
+                        % (sub.capitalize(), sub))
+
+    # Install the entry templates INTO the operator's dir so their working
+    # instance is self-contained and they never have to reach back into the
+    # package to scaffold a learning / project / skill entry.
+    installed_templates = []
+    src_templates = os.path.join(REPO_ROOT, "templates")
+    dst_templates = os.path.join(kdir, "templates")
+    if os.path.isdir(src_templates):
+        os.makedirs(dst_templates, exist_ok=True)
+        for fn in sorted(os.listdir(src_templates)):
+            if not fn.endswith(".md"):
+                continue
+            dst = os.path.join(dst_templates, fn)
+            if not os.path.exists(dst):
+                shutil.copyfile(os.path.join(src_templates, fn), dst)
+                installed_templates.append(fn)
+
+    _write_config(kdir)
+
+    if as_json:
+        json.dump({"ok": True, "knowledge_dir": kdir, "seeded_index": seeded,
+                   "created_dirs": created_dirs, "installed_templates": installed_templates,
+                   "config": HOME_CONFIG},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("INITIALIZED knowledge dir: %s" % kdir)
+        print("  index:  %s%s" % (ipath, " (seeded)" if seeded else " (kept)"))
+        print("  config: %s" % HOME_CONFIG)
+        print("  work:   %s/work/<feature>/   logs: %s/logs/" % (kdir, kdir))
+        if installed_templates:
+            print("  templates installed: %s" % ", ".join(installed_templates))
+        print("Next: run onboarding (.claude/skills/onboarding/SKILL.md) to "
+              "personalize MAIN.md and write the .initialized sentinel.")
+    return 0
+
+
+def cmd_config(args):
+    """Print the resolved knowledge dir. Exit 1 if unconfigured."""
+    kdir = resolve_knowledge_dir()
+    as_json = getattr(args, "format", "text") == "json"
+    initialized = bool(kdir) and os.path.isfile(os.path.join(kdir, SENTINEL_REL))
+    if as_json:
+        json.dump({"knowledge_dir": kdir, "configured": bool(kdir),
+                   "initialized": initialized}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0 if kdir else 1
+    if getattr(args, "knowledge_dir_only", False):
+        # Bare path for shell consumers (hooks). Empty output if unconfigured.
+        if kdir:
+            print(kdir)
+        return 0 if kdir else 1
+    if kdir:
+        print("knowledge_dir: %s" % kdir)
+        print("initialized:   %s" % ("yes" if initialized else "no"))
+        return 0
+    print("knowledge_dir: <unconfigured>")
+    return 1
+
+
+# --- index / query / learn / features / worklog ------------------------------
+def cmd_index_add(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    entry, add_err = _do_add(
+        kdir, data, args.id, args.title, args.category, args.path,
+        parse_tags(args.tags), args.summary, args.created)
+    if add_err is not None:
+        sys.stderr.write("agentware: %s\n" % add_err)
+        return 1
+
+    save_index(kdir, data)
+    if getattr(args, "format", "text") == "json":
+        json.dump({"ok": True, "added": entry}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("ADDED entry '%s' (category=%s, path=%s)"
+              % (args.id, args.category, args.path))
+    return 0
+
+
+def cmd_index_remove(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    entries = data.setdefault("entries", [])
+    tags_map = data.setdefault("tags", {})
+    match = next((e for e in entries if e.get("id") == args.id), None)
+    if match is None:
+        sys.stderr.write("agentware: id not found: %s\n" % args.id)
+        return 1
+
+    entries[:] = [e for e in entries if e.get("id") != args.id]
+    remove_tags_from_map(tags_map, args.id)
+    save_index(kdir, data)
+    if getattr(args, "format", "text") == "json":
+        json.dump({"ok": True, "removed": match}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("REMOVED entry '%s' (file on disk left untouched)" % args.id)
+    return 0
+
+
+def cmd_index_validate(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    errors = [err] if err is not None else validate_index(kdir, data)
+    ok = len(errors) == 0
+    if getattr(args, "format", "text") == "json":
+        json.dump({"ok": ok, "errors": errors}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        if ok:
+            print("VALIDATION PASSED: index.json is consistent.")
+        else:
+            print("VALIDATION FAILED (%d error(s)):" % len(errors))
+            for e in errors:
+                print(" -", e)
+    return 0 if ok else 1
+
+
+def cmd_index_sync(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    candidates = scan_unindexed(kdir, data)
+    as_json = getattr(args, "format", "text") == "json"
+
+    if not args.fix:
+        report = [{"path": p, "suggested_id": _suggest_id(p),
+                   "suggested_category": _infer_category(p)} for p in candidates]
+        if as_json:
+            json.dump({"unindexed": report, "count": len(report)},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            if not report:
+                print("SYNC: no unindexed *.md files in the knowledge dir.")
+            else:
+                print("SYNC: %d unindexed *.md file(s) (dry-run; pass --fix):"
+                      % len(report))
+                for r in report:
+                    print("  %s  ->  id=%s category=%s"
+                          % (r["path"], r["suggested_id"], r["suggested_category"]))
+        return 0
+
+    added, failures = [], []
+    interactive = sys.stdin.isatty()
+    for path in candidates:
+        category = _infer_category(path)
+        eid = _suggest_id(path)
+        title = _suggest_title(path)
+        if interactive:
+            tags_in = input("tags for %s (comma-sep) [%s]: " % (path, category)).strip() \
+                or category
+            summary_in = input("summary for %s [%s]: " % (path, title)).strip() \
+                or title
+        else:
+            tags_in = category
+            summary_in = title
+        entry, add_err = _do_add(
+            kdir, data, eid, title, category, path, parse_tags(tags_in), summary_in)
+        if add_err is not None:
+            failures.append({"path": path, "error": add_err})
+        else:
+            added.append(entry)
+
+    if added:
+        save_index(kdir, data)
+    if as_json:
+        json.dump({"ok": not failures, "added": added, "failures": failures},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        for e in added:
+            print("ADDED entry '%s' (category=%s, path=%s)"
+                  % (e["id"], e["category"], e["path"]))
+        for f in failures:
+            sys.stderr.write("agentware: could not add %s: %s\n"
+                             % (f["path"], f["error"]))
+        if not added and not failures:
+            print("SYNC: nothing to fix; all *.md files already indexed.")
+    return 1 if failures else 0
+
+
+def cmd_query(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    entries = data.get("entries") or []
+    tags_map = data.get("tags") or {}
+    by_id, by_path = {}, {}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        eid = e.get("id")
+        if eid is not None and eid not in by_id:
+            by_id[eid] = e
+        path = e.get("path")
+        if path is not None and path not in by_path:
+            by_path[path] = e
+
+    results = []
+    if args.id is not None:
+        hit = by_id.get(args.id)
+        if hit is not None:
+            results = [hit]
+    elif args.path is not None:
+        hit = by_path.get(args.path)
+        if hit is not None:
+            results = [hit]
+    elif args.tag is not None:
+        for eid in tags_map.get(args.tag, []):
+            hit = by_id.get(eid)
+            if hit is not None:
+                results.append(hit)
+    elif args.category is not None:
+        results = [e for e in entries
+                   if isinstance(e, dict) and e.get("category") == args.category]
+
+    json.dump(results, sys.stdout, ensure_ascii=False, indent=2)
+    sys.stdout.write("\n")
+    return 0
+
+
+def _topic_to_title(topic):
+    words = re.split(r"[^a-zA-Z0-9]+", topic)
+    return " ".join(w.capitalize() for w in words if w) or topic
+
+
+def _render_learning(title, created, tag_list, body):
+    tags_str = ", ".join("`%s`" % t for t in tag_list) if tag_list else "_(none)_"
+    return (
+        "# %s\n\n"
+        "> **Created**: %s  \n"
+        "> **Tags**: %s  \n"
+        "> **Category**: learnings\n\n"
+        "---\n\n"
+        "%s\n\n"
+        "---\n\n"
+        "[← Back to Learnings](./index.md) | [← Back to Main](../MAIN.md)\n"
+        % (title, created, tags_str, body.rstrip("\n"))
+    )
+
+
+def cmd_learn(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    topic = (args.topic or "").strip()
+    if not topic:
+        sys.stderr.write("agentware: --topic must not be empty\n")
+        return 1
+
+    body = sys.stdin.read() if args.content == "-" else args.content
+    if not (body or "").strip():
+        sys.stderr.write("agentware: --content must not be empty\n")
+        return 1
+
+    eid = "learn-%s" % topic
+    rel_path = "%s/%s.md" % (LEARNINGS_REL, topic)
+    abs_path = os.path.join(kdir, rel_path)
+    tag_list = parse_tags(args.tags)
+    title = _topic_to_title(topic)
+    created = _today()
+
+    entries = data.get("entries") or []
+    if any(e.get("id") == eid for e in entries):
+        sys.stderr.write("agentware: duplicate id '%s'\n" % eid)
+        return 1
+    if any(e.get("path") == rel_path for e in entries):
+        sys.stderr.write("agentware: path already indexed: %s\n" % rel_path)
+        return 1
+    if os.path.exists(abs_path):
+        sys.stderr.write(
+            "agentware: learning file already exists (refusing to overwrite): %s\n"
+            % abs_path)
+        return 1
+
+    os.makedirs(learnings_dir(kdir), exist_ok=True)
+    with open(abs_path, "w", encoding="utf-8") as f:
+        f.write(_render_learning(title, created, tag_list, body))
+
+    entry, add_err = _do_add(
+        kdir, data, eid, title, "learnings", rel_path, tag_list, args.summary, created)
+    if add_err is not None:
+        try:
+            os.remove(abs_path)
+        except OSError:
+            pass
+        sys.stderr.write("agentware: %s\n" % add_err)
+        return 1
+
+    save_index(kdir, data)
+    if getattr(args, "format", "text") == "json":
+        json.dump({"ok": True, "learning": entry}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("LEARNED entry '%s' -> %s (registered in index)" % (eid, abs_path))
+    return 0
+
+
+def _render_features(data):
+    markdown = "# Knowledge Base — Features & Capabilities\n\n"
+    markdown += ("> **NOTICE:** Auto-generated from this knowledge base's "
+                 "`index.json` by `scripts/agentware features`. Do not edit "
+                 "manually.\n\n")
+    categories = {}
+    for entry in data.get("entries", []):
+        cat = entry.get("category", "uncategorized")
+        categories.setdefault(cat, []).append(entry)
+    for cat in sorted(categories.keys()):
+        pretty_cat = cat.replace("_", " ").title()
+        markdown += "## %s\n\n" % pretty_cat
+        markdown += "| Title | Path | Summary |\n"
+        markdown += "|-------|------|---------|\n"
+        for entry in categories[cat]:
+            title = entry.get("title", "")
+            path = entry.get("path", "")
+            summary = entry.get("summary", "")
+            markdown += "| **%s** | `[%s](%s)` | %s |\n" % (title, path, path, summary)
+        markdown += "\n"
+    if not categories:
+        markdown += "_No entries yet. Capture knowledge with " \
+                    "`scripts/agentware learn ...`._\n"
+    return markdown
+
+
+def cmd_features(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+    content = _render_features(data)
+    with open(features_path(kdir), "w", encoding="utf-8") as f:
+        f.write(content)
+    if getattr(args, "format", "text") == "json":
+        cat_count = len({e.get("category", "uncategorized")
+                         for e in data.get("entries", [])})
+        json.dump({"ok": True, "path": features_path(kdir),
+                   "entries": len(data.get("entries", [])), "categories": cat_count},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("Successfully generated %s" % features_path(kdir))
+    return 0
+
+
+LEARNED_RE = re.compile(r"^\s*>?\s*LEARNED:\s*(.*?)\s*$")
+
+
+def _slugify(text):
+    return re.sub(r"[^a-z0-9]+", "-", (text or "").lower()).strip("-")
+
+
+def learning_stems(kdir, data):
+    stems = set()
+    for e in (data.get("entries") or []):
+        if not isinstance(e, dict) or e.get("category") != "learnings":
+            continue
+        base = os.path.basename(e.get("path") or "")
+        if base.endswith(".md"):
+            stems.add(base[:-3].lower())
+        eid = e.get("id") or ""
+        if eid.startswith("learn-"):
+            stems.add(eid[len("learn-"):].lower())
+    ldir = learnings_dir(kdir)
+    if os.path.isdir(ldir):
+        for fn in os.listdir(ldir):
+            if fn.endswith(".md") and fn != "index.md":
+                stems.add(fn[:-3].lower())
+    return {s for s in stems if s}
+
+
+def _is_promoted(marker_text, stems):
+    slug = _slugify(marker_text)
+    if not slug:
+        return False
+    for stem in stems:
+        if slug == stem or stem in slug or slug in stem:
+            return True
+    return False
+
+
+def scan_worklog(path, kdir, data):
+    stems = learning_stems(kdir, data)
+    unpromoted, total = [], 0
+    with open(path, "r", encoding="utf-8") as f:
+        for lineno, line in enumerate(f, start=1):
+            m = LEARNED_RE.match(line)
+            if not m:
+                continue
+            text = m.group(1).strip()
+            if not text:
+                continue
+            total += 1
+            if not _is_promoted(text, stems):
+                unpromoted.append({"line": lineno, "text": text})
+    return unpromoted, total
+
+
+def cmd_worklog_scan(args):
+    if not os.path.isfile(args.path):
+        sys.stderr.write("agentware: worklog not found: %s\n" % args.path)
+        return 1
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    data, err = load_index(kdir)
+    if err is not None:
+        sys.stderr.write("agentware: %s\n" % err)
+        return 1
+
+    unpromoted, total = scan_worklog(args.path, kdir, data)
+    ok = len(unpromoted) == 0
+    if getattr(args, "format", "text") == "json":
+        json.dump({"unpromoted": unpromoted, "total": total},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        if ok:
+            print("WORKLOG SCAN PASSED: %d LEARNED marker(s), all promoted." % total)
+        else:
+            print("WORKLOG SCAN FAILED: %d of %d LEARNED marker(s) unpromoted:"
+                  % (len(unpromoted), total))
+            for item in unpromoted:
+                print("  line %d: %s" % (item["line"], item["text"]))
+    return 0 if ok else 1
+
+
+# --- Audit -------------------------------------------------------------------
+def tag_consistency_errors(data):
+    errors = []
+    entries = data.get("entries") or []
+    tags = data.get("tags") or {}
+    by_id = {e.get("id"): e for e in entries
+             if isinstance(e, dict) and e.get("id")}
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        eid = e.get("id")
+        for t in (e.get("tags") or []):
+            ids = tags.get(t)
+            if not isinstance(ids, list) or eid not in ids:
+                errors.append("tag map missing id '%s' under tag '%s'" % (eid, t))
+    for t, ids in tags.items():
+        if not isinstance(ids, list):
+            errors.append("tag '%s' is not a list" % t)
+            continue
+        if not ids:
+            errors.append("tag '%s' has an empty entry list" % t)
+        for eid in ids:
+            entry = by_id.get(eid)
+            if entry is None:
+                errors.append("tag '%s' references unknown id '%s'" % (t, eid))
+            elif t not in (entry.get("tags") or []):
+                errors.append("entry '%s' missing back-ref for tag '%s'" % (eid, t))
+    return errors
+
+
+def template_conformance_errors(kdir, data):
+    errors = []
+    ldir = learnings_dir(kdir)
+    if os.path.isdir(ldir):
+        for fn in sorted(os.listdir(ldir)):
+            if not fn.endswith(".md") or fn == "index.md":
+                continue
+            fp = os.path.join(ldir, fn)
+            try:
+                with open(fp, "r", encoding="utf-8") as f:
+                    text = f.read()
+            except OSError as exc:
+                errors.append("cannot read %s: %s" % (fp, exc))
+                continue
+            if not re.search(r"(?m)^#\s+\S", text):
+                errors.append("learning '%s' missing H1 title" % fp)
+
+    projects_dir = os.path.join(kdir, "projects")
+    if os.path.isdir(projects_dir):
+        for name in sorted(os.listdir(projects_dir)):
+            d = os.path.join(projects_dir, name)
+            if not os.path.isdir(d):
+                continue
+            fp = os.path.join(d, "index.md")
+            if not os.path.isfile(fp):
+                errors.append("project '%s' missing index.md" % name)
+                continue
+            with open(fp, "r", encoding="utf-8") as f:
+                text = f.read()
+            if not re.search(r"(?m)^#\s+\S", text):
+                errors.append("project index '%s' missing H1 title" % fp)
+    return errors
+
+
+def orphaned_learning_errors(kdir, data):
+    errors = []
+    have = indexed_paths(data)
+    ldir = learnings_dir(kdir)
+    if os.path.isdir(ldir):
+        for fn in sorted(os.listdir(ldir)):
+            if not fn.endswith(".md") or fn == "index.md":
+                continue
+            rel = "%s/%s" % (LEARNINGS_REL, fn)
+            if rel not in have:
+                errors.append("orphaned learning (on disk, not indexed): %s" % rel)
+    return errors
+
+
+def _audit_steering_lint_check():
+    result = lint_steering()
+    details = []
+    if not result["budget_ok"]:
+        details.append("char budget exceeded: %d > %d" % (
+            result["total_chars"], result["char_budget"]))
+    for v in result["violations"]:
+        details.append("%s %s:%d %s" % (v["rule"], v["file"], v["line"], v["text"]))
+    for b in result["banned_words"]:
+        details.append("DSF-5 %s:%d banned %r" % (b["file"], b["line"], b["word"]))
+    return {
+        "name": "steering_lint",
+        "ok": result["ok"],
+        "details": details or ["DSF-clean: %d/%d chars" % (
+            result["total_chars"], result["char_budget"])],
+    }
+
+
+def cmd_audit(args):
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    as_json = getattr(args, "format", "text") == "json"
+    data, err = load_index(kdir)
+    if err is not None:
+        checks = [{"name": "index_validate", "ok": False, "details": [err]}]
+    else:
+        ve = validate_index(kdir, data)
+        un = scan_unindexed(kdir, data)
+        te = tag_consistency_errors(data)
+        tce = template_conformance_errors(kdir, data)
+        oe = orphaned_learning_errors(kdir, data)
+        checks = [
+            {"name": "index_validate", "ok": not ve, "details": ve},
+            {"name": "filesystem_sync", "ok": not un, "details": un},
+            {"name": "tag_consistency", "ok": not te, "details": te},
+            {"name": "template_conformance", "ok": not tce, "details": tce},
+            {"name": "orphaned_learnings", "ok": not oe, "details": oe},
+            _audit_steering_lint_check(),
+        ]
+    ok = all(c["ok"] for c in checks)
+    if as_json:
+        json.dump({"ok": ok, "checks": checks}, sys.stdout,
+                  ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("AUDIT %s (%d check(s)):" % ("PASSED" if ok else "FAILED", len(checks)))
+        for c in checks:
+            print("  [%s] %s" % ("ok" if c["ok"] else "FAIL", c["name"]))
+            if not c["ok"]:
+                for d in c["details"]:
+                    print("      - %s" % d)
+    return 0 if ok else 1
+
+
+# --- Steering DSF lint -------------------------------------------------------
+def _steering_files():
+    files = []
+    for name in STEERING_EXPLICIT:
+        p = os.path.join(REPO_ROOT, name)
+        if os.path.exists(p):
+            files.append(p)
+    files.extend(sorted(glob.glob(STEERING_GLOB)))
+    return files
+
+
+def _iter_rule_lines(text):
+    lines = text.splitlines()
+    in_front = in_code = False
+    for i, raw in enumerate(lines, 1):
+        stripped = raw.strip()
+        if i == 1 and stripped == "---":
+            in_front = True
+            continue
+        if in_front:
+            if stripped == "---":
+                in_front = False
+            continue
+        if stripped.startswith("```"):
+            in_code = not in_code
+            continue
+        if in_code:
+            continue
+        m = DSF_BULLET_RE.match(raw)
+        if not m:
+            continue
+        body = m.group(1).strip()
+        if body:
+            yield i, body
+
+
+def _first_token_verb(body):
+    first = body.split()[0]
+    return first.strip("*_`").rstrip(":.,")
+
+
+def lint_steering():
+    violations, banned_words = [], []
+    total_chars = 0
+    for path in _steering_files():
+        try:
+            text = open(path, "r", encoding="utf-8").read()
+        except OSError as exc:
+            violations.append({"rule": "DSF-read", "file": path,
+                               "line": 0, "text": str(exc)})
+            continue
+        total_chars += len(text)
+        for lineno, body in _iter_rule_lines(text):
+            verb = _first_token_verb(body)
+            if verb not in DSF_VERBS:
+                violations.append({"rule": "DSF-2", "file": path, "line": lineno,
+                                   "text": body})
+            if not DSF_RULE_ID_RE.search(body):
+                violations.append({"rule": "DSF-6", "file": path, "line": lineno,
+                                   "text": body})
+            low = body.lower()
+            for w in DSF_BANNED_WORDS:
+                if re.search(r"\b" + re.escape(w) + r"\b", low):
+                    banned_words.append({"file": path, "line": lineno,
+                                         "word": w, "text": body})
+    budget_ok = total_chars <= STEERING_CHAR_BUDGET
+    ok = (not violations) and (not banned_words) and budget_ok
+    return {"ok": ok, "total_chars": total_chars, "char_budget": STEERING_CHAR_BUDGET,
+            "budget_ok": budget_ok, "violations": violations,
+            "banned_words": banned_words}
+
+
+def cmd_steering_lint(args):
+    result = lint_steering()
+    as_json = getattr(args, "format", "text") == "json"
+    if as_json:
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("STEERING LINT %s" % ("PASSED" if result["ok"] else "FAILED"))
+        print("  chars: %d / %d (budget %s)" % (
+            result["total_chars"], result["char_budget"],
+            "ok" if result["budget_ok"] else "EXCEEDED"))
+        for v in result["violations"]:
+            print("  [%s] %s:%d  %s" % (v["rule"], v["file"], v["line"], v["text"]))
+        for b in result["banned_words"]:
+            print("  [DSF-5] %s:%d  banned %r in: %s" % (
+                b["file"], b["line"], b["word"], b["text"]))
+    return 0 if result["ok"] else 1
+
+
+# --- Parser construction -----------------------------------------------------
+def build_parser():
+    fmt_parent = argparse.ArgumentParser(add_help=False)
+    fmt_parent.add_argument("--format", choices=("text", "json"), default="text",
+                            help="output format (default: text)")
+
+    parser = argparse.ArgumentParser(
+        prog="agentware",
+        parents=[fmt_parent],
+        description="Deterministic CLI toolkit for an agentware workspace.")
+    sub = parser.add_subparsers(dest="command", metavar="<command>")
+    sub.required = True
+
+    # init -------------------------------------------------------------------
+    p_init = sub.add_parser(
+        "init", parents=[fmt_parent],
+        help="scaffold the external knowledge dir + seed index + write config")
+    p_init.add_argument("--knowledge-dir", required=True, dest="knowledge_dir",
+                        help="absolute or ~ path to store this operator's knowledge")
+    p_init.set_defaults(func=cmd_init)
+
+    # config -----------------------------------------------------------------
+    p_cfg = sub.add_parser(
+        "config", parents=[fmt_parent], help="show the resolved knowledge dir")
+    p_cfg.add_argument("--knowledge-dir-only", action="store_true",
+                       dest="knowledge_dir_only",
+                       help="print only the bare path (for shell consumers)")
+    p_cfg.set_defaults(func=cmd_config)
+
+    # index ------------------------------------------------------------------
+    p_index = sub.add_parser("index", help="manage the knowledge index.json")
+    index_sub = p_index.add_subparsers(dest="index_command", metavar="<subcommand>")
+    index_sub.required = True
+
+    p_add = index_sub.add_parser(
+        "add", parents=[fmt_parent], help="register a new entry in index.json")
+    p_add.add_argument("--id", required=True, help="unique entry id")
+    p_add.add_argument("--title", required=True, help="human-readable title")
+    p_add.add_argument("--category", required=True,
+                       help="one of: %s" % ", ".join(CATEGORIES))
+    p_add.add_argument("--path", required=True,
+                       help="knowledge-dir-relative path (must exist)")
+    p_add.add_argument("--tags", required=True, help="comma-separated tags")
+    p_add.add_argument("--summary", required=True, help="one-line summary")
+    p_add.add_argument("--created", default=None, help="YYYY-MM-DD (default: today)")
+    p_add.set_defaults(func=cmd_index_add)
+
+    p_rm = index_sub.add_parser(
+        "remove", parents=[fmt_parent], help="unregister an entry from index.json")
+    p_rm.add_argument("--id", required=True, help="id of the entry to remove")
+    p_rm.set_defaults(func=cmd_index_remove)
+
+    p_val = index_sub.add_parser(
+        "validate", parents=[fmt_parent], help="validate index.json integrity")
+    p_val.set_defaults(func=cmd_index_validate)
+
+    p_sync = index_sub.add_parser(
+        "sync", parents=[fmt_parent], help="report (or --fix) unindexed *.md files")
+    p_sync.add_argument("--fix", action="store_true",
+                        help="add missing entries instead of just reporting")
+    p_sync.set_defaults(func=cmd_index_sync)
+
+    # query ------------------------------------------------------------------
+    p_query = sub.add_parser(
+        "query", parents=[fmt_parent], help="look up entries (O(1) by id/path/tag)")
+    q_group = p_query.add_mutually_exclusive_group(required=True)
+    q_group.add_argument("--id", help="look up a single entry by id")
+    q_group.add_argument("--path", help="look up a single entry by path")
+    q_group.add_argument("--category", help="list all entries in a category")
+    q_group.add_argument("--tag", help="list all entries carrying a tag")
+    p_query.set_defaults(func=cmd_query)
+
+    # learn ------------------------------------------------------------------
+    p_learn = sub.add_parser(
+        "learn", parents=[fmt_parent], help="create + register a learning file")
+    p_learn.add_argument("--topic", required=True, help="filename stem under learnings/")
+    p_learn.add_argument("--summary", required=True, help="one-line summary")
+    p_learn.add_argument("--tags", required=True, help="comma-separated tags")
+    p_learn.add_argument("--content", required=True,
+                         help="learning body, or '-' to read from stdin")
+    p_learn.set_defaults(func=cmd_learn)
+
+    # features ---------------------------------------------------------------
+    p_feat = sub.add_parser(
+        "features", parents=[fmt_parent],
+        help="regenerate FEATURES.md from the knowledge index.json")
+    p_feat.set_defaults(func=cmd_features)
+
+    # worklog ----------------------------------------------------------------
+    p_wl = sub.add_parser("worklog", help="worklog utilities")
+    wl_sub = p_wl.add_subparsers(dest="worklog_command", metavar="<subcommand>")
+    wl_sub.required = True
+    p_scan = wl_sub.add_parser(
+        "scan", parents=[fmt_parent],
+        help="find unpromoted '> LEARNED:' markers in a worklog")
+    p_scan.add_argument("--path", required=True, help="path to a worklog.md")
+    p_scan.set_defaults(func=cmd_worklog_scan)
+
+    # audit ------------------------------------------------------------------
+    p_audit = sub.add_parser(
+        "audit", parents=[fmt_parent], help="run all consistency checks in one pass")
+    p_audit.set_defaults(func=cmd_audit)
+
+    # steering ---------------------------------------------------------------
+    p_steer = sub.add_parser("steering", help="Deterministic Steering Format tooling")
+    steer_sub = p_steer.add_subparsers(dest="steering_command", metavar="<subcommand>")
+    steer_sub.required = True
+    p_lint = steer_sub.add_parser(
+        "lint", parents=[fmt_parent], help="enforce DSF on always-loaded steering")
+    p_lint.set_defaults(func=cmd_steering_lint)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
