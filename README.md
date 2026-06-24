@@ -135,7 +135,7 @@ agentware/
 │   └── project-context.md
 ├── .claude/
 │   ├── settings.json                  # default model + hooks
-│   ├── agents/                        # agentware-planner / -execution / -reviewer (subagents)
+│   ├── agents/                        # agentware-planner / -execution (subagents)
 │   ├── skills/                        # onboarding, knowledge-base, ui-verification, self-improvement
 │   └── commands/                      # /agentware-plan slash command
 ├── templates/                         # learning / project / skill entry templates
@@ -154,20 +154,22 @@ all point other runtimes at `AGENTS.md`.
 
 ## Using the agents (zero-prompt)
 
-The three roles are Claude Code **subagents** in `.claude/agents/`. Onboarding
-installs three aliases (and verifies they work) so the whole system is one word:
+The two roles are Claude Code **subagents** in `.claude/agents/`. Onboarding
+installs two aliases (and verifies they work) so the whole system is one word:
 
 ```bash
 # >>> agentware aliases >>>   (onboarding writes your real absolute path in place of /path/to/agentware)
 alias PLAN_AW='(cd /path/to/agentware && claude --agent agentware-planner --dangerously-skip-permissions)'
 alias WORK_AW='(cd /path/to/agentware && claude --agent agentware-execution --dangerously-skip-permissions)'
-alias REVIEW_AW='(cd /path/to/agentware && claude --agent agentware-reviewer --dangerously-skip-permissions)'
 # <<< agentware aliases <<<
 ```
 
-- `PLAN_AW` — draft a feature plan (writes only `plan.md`, never executes).
-- `WORK_AW` — execute the work.
-- `REVIEW_AW` — read-only PASS/FAIL assessment.
+- `PLAN_AW` — draft a feature plan (writes only `plan.md`, never executes). During
+  research it runs `scripts/agentware recall` for ranked-relevant prior learnings/plans.
+- `WORK_AW` — execute the work. It runs `scripts/agentware recall` at task start,
+  promotes learnings before the completion promise, and runs `scripts/agentware audit
+  --stale` before adding to the knowledge base. The loop's POST phase self-assesses
+  via this agent.
 
 The `(cd … && …)` subshell means you can run these from **any directory** — they
 load agentware's agents/steering/hooks from the repo and leave your terminal's

@@ -239,21 +239,20 @@ If no, skip to 7b. If yes:
    - If `gh` is NOT available: print the manual `git remote add origin <URL>` /
      `git push -u origin main` steps; do not hardcode URLs.
 
-#### Step 7b — Install the three workflow aliases (and VERIFY them)
+#### Step 7b — Install the two workflow aliases (and VERIFY them)
 
-These three aliases are the whole interface. Each launches the matching subagent
+These two aliases are the whole interface. Each launches the matching subagent
 with permissions pre-granted (`--dangerously-skip-permissions`) so the user is
 never asked to approve commands mid-flow:
 
 - `PLAN_AW`   → `agentware-planner` (drafts plans, never executes)
-- `WORK_AW`   → `agentware-execution` (runs the work)
-- `REVIEW_AW` → `agentware-reviewer` (read-only PASS/FAIL)
+- `WORK_AW`   → `agentware-execution` (runs the work; the loop's POST phase self-assesses via this agent)
 
 **Always ask before writing to a shell rc; never append silently.** But do treat
 this as a required, verified step — don't finish onboarding until the aliases
 resolve.
 
-1. Ask: "Install the three workflow aliases (`PLAN_AW`, `WORK_AW`, `REVIEW_AW`)
+1. Ask: "Install the two workflow aliases (`PLAN_AW`, `WORK_AW`)
    into your shell rc? They make the system zero-friction. (y/n)". If the user
    declines, note it and skip to 7c.
 2. Detect the shell rc: `echo "$SHELL"` → `~/.zshrc` (zsh) or `~/.bashrc` /
@@ -269,7 +268,6 @@ resolve.
    # >>> agentware aliases >>>
    alias PLAN_AW='(cd "$AW_REPO" && claude --agent agentware-planner --dangerously-skip-permissions)'
    alias WORK_AW='(cd "$AW_REPO" && claude --agent agentware-execution --dangerously-skip-permissions)'
-   alias REVIEW_AW='(cd "$AW_REPO" && claude --agent agentware-reviewer --dangerously-skip-permissions)'
    # <<< agentware aliases <<<
    ```
    Write the LITERAL absolute path (e.g. `/Users/you/agentware`), not the
@@ -282,13 +280,13 @@ resolve.
    - `command -v claude` must succeed (the runtime is on PATH). If not, tell the
      user to install/login to Claude Code and that the aliases will work once it is.
    - Confirm each alias resolves in a fresh interactive shell of the user's type:
-     - zsh: `zsh -ic 'alias PLAN_AW; alias WORK_AW; alias REVIEW_AW'`
-     - bash: `bash -ic 'type PLAN_AW WORK_AW REVIEW_AW'`
-     All three must print the alias definition. If they don't (e.g. the rc isn't
+     - zsh: `zsh -ic 'alias PLAN_AW; alias WORK_AW'`
+     - bash: `bash -ic 'type PLAN_AW WORK_AW'`
+     Both must print the alias definition. If they don't (e.g. the rc isn't
      auto-sourced), tell the user to run `source <rc>` or open a new terminal.
    - Report the verification result to the user explicitly (✅/❌ per alias).
 7. Tell the user: "`source <rc>` (or open a new terminal), then just run
-   `PLAN_AW` to plan, `WORK_AW` to execute, `REVIEW_AW` to review."
+   `PLAN_AW` to plan and `WORK_AW` to execute."
 
 #### Step 7c — Write the sentinel and announce
 
@@ -306,8 +304,8 @@ resolve.
    > automatically and logs your prompts + transcripts to `<KDIR>/logs/`.
    >
    > Day-to-day: run `PLAN_AW` to design a feature, then `WORK_AW` to execute it
-   > (or `./agentware.sh <feature>` for the autonomous loop), then `REVIEW_AW` to
-   > assess. Plans live in `<KDIR>/work/<feature>/`.
+   > (or `./agentware.sh <feature>` for the autonomous loop); the loop's POST phase
+   > self-assesses via the execution agent. Plans live in `<KDIR>/work/<feature>/`.
    >
    > To change agentware itself, ask explicitly — I'll warn you first, since that
    > can destabilize the system."

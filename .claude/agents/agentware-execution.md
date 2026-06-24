@@ -55,7 +55,8 @@ Execute ONE task per iteration:
 7. Update task status in `plan.md` (⬜ → 🟡 → ✅) and append an entry to
    `worklog.md` with timestamp, what was done, verification output, and next steps.
 8. If the task touches the knowledge base, mutate it ONLY via `scripts/agentware`
-   (never hand-edit index.json).
+   (never hand-edit index.json). First run `scripts/agentware audit --stale` to catch
+   stale/duplicate learnings before adding more.
 9. PROMOTE-BEFORE-PROMISE GATE (mandatory, R-SI-03): run
    `scripts/agentware worklog scan --path <knowledge-dir>/work/<feature>/worklog.md`.
    If it reports ANY unpromoted `> LEARNED:` markers, promote EACH now via the

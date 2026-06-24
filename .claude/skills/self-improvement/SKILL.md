@@ -1,8 +1,8 @@
 # Self-Improvement Skill — How agentware Grows Its Own Skills
 
 > **When to invoke**: at the end of any task or iteration, when you notice you
-> just did something you'll likely do again — or when the post-phase reviewer
-> extracts knowledge from a worklog. agentware treats incidental learnings as
+> just did something you'll likely do again — or when the post-phase assessment
+> (run by the execution agent) extracts knowledge from a worklog. agentware treats incidental learnings as
 > cheap (just write them) and skill promotion as a small, auditable negotiation
 > with the user.
 
@@ -12,7 +12,7 @@ Without an explicit promotion procedure, knowledge dies in three places:
 
 1. **In conversation**, when the agent says "ah, I figured out X" but never
    writes it down.
-2. **In `assessment.md`**, when the reviewer extracts a learning and nothing
+2. **In `assessment.md`**, when the post-phase assessment extracts a learning and nothing
    moves it into the live knowledge base.
 3. **In `worklog.md`**, where worklogs grow long and the reusable bits get buried.
 

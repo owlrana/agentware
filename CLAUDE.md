@@ -33,9 +33,9 @@ an `AGENTWARE_STATUS:` line each session reporting whether it is initialized.
 1. The 3-phase loop is `./agentware.sh <feature>` (see `docs/loop.md`).
 2. The deterministic toolkit is `scripts/agentware` — the ONLY writer of the
    knowledge index. Resolve the external knowledge dir at runtime; never hardcode it.
-3. The roles are Claude Code subagents in `.claude/agents/`: `agentware-planner`
-   (plan only, never executes), `agentware-execution` (implements the loop),
-   `agentware-reviewer` (read-only PASS/FAIL assessment).
+3. The roles are two Claude Code subagents in `.claude/agents/`: `agentware-planner`
+   (plan only, never executes) and `agentware-execution` (implements the loop; the
+   loop's POST phase self-assesses via this agent).
 4. Skills live in `.claude/skills/` (onboarding, knowledge-base, self-improvement,
    ui-verification). The `/agentware-plan` command scaffolds a feature plan.
 5. On failure, follow the **failure-handling escalation ladder** in `AGENTS.md`

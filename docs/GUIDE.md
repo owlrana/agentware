@@ -34,7 +34,7 @@ that you own completely, and how everything is tracked deterministically.
    - ask **where to store your knowledge base** (e.g. `~/agentware-knowledge`),
    - run `scripts/agentware init` to build that directory,
    - interview you briefly + look at your system,
-   - install the three aliases below and **verify they work**,
+   - install the two aliases below and **verify they work**,
    - write the `.initialized` sentinel.
 
 After that you never run onboarding again.
@@ -48,9 +48,8 @@ After that you never run onboarding again.
 
 | Command | Agent | What it does |
 |---------|-------|--------------|
-| `PLAN_AW` | planner | Designs a feature plan with you. Writes only `plan.md`. **Never executes.** |
-| `WORK_AW` | execution | Implements the work, verifying each step, logging as it goes. |
-| `REVIEW_AW` | reviewer | Read-only PASS/FAIL assessment of completed work. |
+| `PLAN_AW` | planner | Designs a feature plan with you, using `scripts/agentware recall` to surface relevant prior learnings. Writes only `plan.md`. **Never executes.** |
+| `WORK_AW` | execution | Implements the work: `recall` at task start, verifies each step, promotes learnings before the completion promise, runs `audit --stale` before KB writes. The loop's POST phase self-assesses via this agent. |
 
 Each alias is `(cd /your/agentware && claude --agent … --dangerously-skip-permissions)`:
 - The `cd` subshell means you can run them from **any directory** — they always
@@ -78,7 +77,8 @@ cd /your/agentware
    - Autonomous: `cd /your/agentware && ./agentware.sh <YYMMDD-feature>`.
    The agent works task-by-task, verifies with your project's own commands, and
    writes a `worklog.md` next to the plan.
-3. `REVIEW_AW` → a PASS/FAIL assessment + any learnings to capture.
+3. The loop's POST phase self-assesses via the execution agent (PASS/FAIL + any
+   learnings to capture).
 4. Anything learned along the way is saved to your knowledge base automatically.
 
 ---

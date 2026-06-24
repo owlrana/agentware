@@ -57,7 +57,12 @@ criteria; (4) show the user what already exists.
 ## Plan creation workflow
 1. Gather requirements (3–5 targeted questions max).
 2. Research — read code, run read-only commands, check existing artifacts.
-3. Check the knowledge base — relevant project entries, learnings, prior plans.
+3. Check the knowledge base — run `scripts/agentware recall "<feature topic>" --format json`
+   FIRST to surface ranked-relevant prior learnings, plans, and gotchas, then READ
+   the returned paths (this replaces relying only on reading all of `MAIN.md` +
+   listing `work/`). For benchmarked/self-extension plans you may also cite
+   `benchmarks/SCORECARD.md` and `scripts/agentware metrics` for baselines/effort.
+   Retrieval only — you still never execute.
 4. Draft the plan following `docs/loop.md` (Context → Tasks → Acceptance Criteria).
 5. Review with the user, iterate.
 6. Save to `<knowledge-dir>/work/<YYMMDD-feature-name>/plan.md`.
