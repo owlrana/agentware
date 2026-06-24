@@ -86,6 +86,19 @@ Every task runs this loop. Do not skip steps; do not stop until all subtasks are
 - IF the change is a mutation THEN do a read-after-write and capture the request/response in the worklog. [R-VERIFY-04]
 - MUST ensure the user can independently access and verify the result. [R-VERIFY-05]
 
+## Failure handling (escalation ladder)
+
+> On a failed step, walk this ladder IN ORDER and ADVANCE the moment a tier is exhausted. Never loop a tier; always maintain forward progress toward the goal.
+
+- IF a step fails THEN walk the ladder — (1) knowledge base → (2) own reasoning → (3) change inputs → (4) switch approach → (5) web search — advancing as each tier is exhausted. [R-FAIL-01]
+- IF a step fails THEN FIRST query the knowledge base for the error signature and READ it to judge whether the match applies to the LIVE state; NEVER apply a stored fix blindly. [R-FAIL-02]
+- IF the KB has no applicable match THEN fall back to your own reasoning and knowledge rather than re-reading. [R-FAIL-03]
+- NEVER repeat an identical failing action; every retry MUST change an input, assumption, or approach. [R-FAIL-04]
+- IF a few (≤3) attempts on one approach still fail THEN switch approach completely, do not keep tweaking. [R-FAIL-05]
+- IF the KB and your own knowledge are exhausted, OR the framework/error is unfamiliar, THEN search the web for current solutions before continuing (see R-WEB-01). [R-FAIL-06]
+- MUST maintain forward progress: bound lookups to one pass per distinct error; NEVER get stuck re-reading or re-querying. [R-FAIL-07]
+- ALWAYS treat a point-in-time value in a learning (id, path, IP, version) as suspect; verify it against live state, and correct the learning if it contradicts. [R-FAIL-08]
+
 ## Anti-patterns
 
 - NEVER create knowledge entries for things not yet built. [R-AP-01]

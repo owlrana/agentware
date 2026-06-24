@@ -38,3 +38,6 @@ an `AGENTWARE_STATUS:` line each session reporting whether it is initialized.
    `agentware-reviewer` (read-only PASS/FAIL assessment).
 4. Skills live in `.claude/skills/` (onboarding, knowledge-base, self-improvement,
    ui-verification). The `/agentware-plan` command scaffolds a feature plan.
+5. On failure, follow the **failure-handling escalation ladder** in `AGENTS.md`
+   (`R-FAIL-01..08`): KB → own reasoning → change inputs → switch approach (after ≤3 tries)
+   → web search. Keep moving; never re-loop a tier.
