@@ -80,16 +80,35 @@ scripts/agentware config --set-autocommit off   # persist an opt-out (or on|yes)
 AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh <feature>   # disable for one run
 ```
 
-`logs/` (session transcripts) is **gitignored and untracked**, so auto-commit only
-ever versions knowledge, never transcripts. When set, the loop folds a
-deterministic git cadence into its phases — scoped to **your knowledge repo only**
-(never your code project, never the agentware package):
+`logs/` (session transcripts) and `.loop/` (ephemeral per-feature loop state —
+iteration counters, `.done`, `live-stream.log`) are both **gitignored and
+untracked**, so auto-commit only ever versions knowledge, never transcripts or
+loop bookkeeping. When set, the loop folds a deterministic git cadence into its
+phases — scoped to **your knowledge repo only** (never your code project, never
+the agentware package):
 
 - **Pre-phase** fast-forwards the KB from upstream at a safe point (clean tree with
   an upstream). Dirty/offline/no-upstream → a graceful skip that never blocks the run.
-- **Post-phase**, at its very tail and **only after the zero-knowledge-loss gate
-  passes** (every `> LEARNED:` promoted, index valid), stages only files under the
-  knowledge dir into **one** `feat|chore(<tag>): <message>` commit, then pushes.
+- **After the post-phase** (not before it), the commit+push runs as a separate
+  `run_kb_sync` step so the assessment the post-phase just wrote — `assessment.md`
+  plus its `benchmarks/history.jsonl` + `SCORECARD.md` ledger rows — is captured in
+  the SAME commit as the main work, leaving no uncommitted tail. It runs on BOTH the
+  post-ran and `--skip-post` paths. Only after the zero-knowledge-loss gate passes
+  (every `> LEARNED:` promoted, index valid — re-checked here in case the post-phase
+  added a marker) does it stage only files under the knowledge dir into **one**
+  `feat|chore(<tag>): <message>` commit, then push. The `<message>` is derived
+  **deterministically** (no LLM/network) so the subject says *what was worked on*,
+  not a generic file list: `run_kb_sync` reads the plan's one-line title
+  (`# Plan: <title>` in `<knowledge-dir>/work/<feature>/plan.md`) and passes it as
+  `--type feat --message "<title>"`. `cmd_kb_git_commit` then appends a compact
+  ` — learnings: <topics>` suffix naming the changed knowledge entries (basenames
+  of staged `learnings/*.md` + `skills/**`, capped at 5 with `+N more`). Full
+  subject form: **`feat|chore(<feature>): <plan title> [— learnings: …]`**, e.g.
+  `feat(autocommit-message-fix): Autocommit Message Fix — learnings: loop-state, msg-derivation`.
+  Robust fallbacks (never crashes/empty): no plan title → the changed-knowledge
+  topics become the summary; no knowledge either → the legacy `sync <dirs> (N files)`
+  dir-list. The whole subject is truncated to one valid line (≤100 chars) that still
+  matches the `feat|chore(<tag>): …` format check.
 - **On push conflict**, conflicts in the *derived* files (`index.json`, the
   `*/index.md` rosters, `FEATURES.md`) are resolved by **rebuilding them from entry
   frontmatter** (`index rebuild`) — never by an agent. Only a same-entry *prose*

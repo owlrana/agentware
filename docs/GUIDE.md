@@ -226,7 +226,13 @@ scripts/agentware kb-git push        # push, auto-resolving derived-file conflic
    loss gate passes** — i.e. every `> LEARNED:` marker has been promoted and the
    index validates. It stages **only** files under your knowledge dir and makes
    **one** conventional commit: `feat|chore(<tag>): <message>` (the `<tag>` is
-   derived from the feature/dominant category; the message summarizes the change).
+   derived from the feature/dominant category). The `<message>` is built
+   **deterministically** (no LLM) to say *what was worked on*: the plan's one-line
+   title (`# Plan: <title>`) plus a ` — learnings: <topics>` suffix naming the
+   changed knowledge entries — i.e. `feat|chore(<feature>): <plan title>
+   [— learnings: …]`, truncated to one valid ≤100-char line. With no plan title it
+   falls back to the changed-knowledge topics, and with neither to a
+   `sync <dirs> (N files)` summary (never empty). See `docs/loop.md`.
    It can never stage your code project or the agentware package — a scope guard
    refuses if the target's work-tree root is the package repo.
 

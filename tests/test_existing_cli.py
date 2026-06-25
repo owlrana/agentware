@@ -333,11 +333,28 @@ class TestKbGitignoreScaffold(unittest.TestCase):
         self.assertIn("logs/", lines)
         self.assertIn("*.tmp", lines)  # original content preserved
 
-    def test_recognizes_bare_logs_without_trailing_slash(self):
+    def test_recognizes_bare_rules_without_trailing_slash(self):
+        # Both required rules present in bare (no trailing slash) form → recognized
+        # as already-ignored (normalized by stripping the trailing slash), so the
+        # helper is a no-op "kept" and does not duplicate them.
+        with open(self._path(), "w", encoding="utf-8") as f:
+            f.write("logs\n.loop\n")
+        action = self.cli._ensure_kb_gitignore(self.kdir)
+        self.assertEqual(action, "kept")
+        lines = [ln.strip() for ln in self._read().splitlines()]
+        self.assertEqual(lines.count("logs"), 1)  # not duplicated as logs/
+        self.assertEqual(lines.count(".loop"), 1)  # not duplicated as .loop/
+
+    def test_appends_only_missing_loop_rule_to_bare_logs(self):
+        # A KB scaffolded before `.loop/` existed (only bare `logs`) self-heals:
+        # the missing `.loop/` rule is appended; the recognized `logs` is kept.
         with open(self._path(), "w", encoding="utf-8") as f:
             f.write("logs\n")
         action = self.cli._ensure_kb_gitignore(self.kdir)
-        self.assertEqual(action, "kept")
+        self.assertEqual(action, "appended")
+        lines = [ln.strip() for ln in self._read().splitlines()]
+        self.assertIn(".loop/", lines)  # missing rule added
+        self.assertEqual(lines.count("logs"), 1)  # existing bare rule not re-added
 
 
 if __name__ == "__main__":

@@ -179,6 +179,82 @@ class KbGitCommitTest(unittest.TestCase):
         # tag is sanitized to lowercase; type honored; message verbatim.
         self.assertEqual(_head_subject(repo), "feat(recall): add recall learning")
 
+    def test_knowledge_topics_helper(self):
+        """kb_changed_knowledge_topics maps staged paths -> sorted entry topics."""
+        topics = self.cli.kb_changed_knowledge_topics([
+            "learnings/foo.md", "skills/bar/SKILL.md", "references/x.md",
+            "MAIN.md", "index.json", "skills/baz.md", "learnings/foo.md",
+        ])
+        self.assertEqual(topics, ["bar", "baz", "foo"])  # deduped + sorted
+
+    def test_default_message_names_changed_learnings(self):
+        """No --message + changed learnings -> subject names the topics (not dir list)."""
+        repo = _init_repo(self._mk("learn"))
+        os.makedirs(os.path.join(repo, "learnings"))
+        for t in ("alpha-topic", "beta-topic"):
+            with open(os.path.join(repo, "learnings", t + ".md"),
+                      "w", encoding="utf-8") as f:
+                f.write("# %s\n" % t)
+        _run(repo, "add", "-A")  # tracked dirs surface entries individually (real KB)
+        code, out, err = run_cli(
+            ["kb-git", "commit", "--path", repo, "--tag", "msgfix"], repo)
+        self.assertEqual(code, 0, err)
+        subj = _head_subject(repo)
+        self.assertIn("alpha-topic", subj)
+        self.assertIn("beta-topic", subj)
+        self.assertNotIn("sync ", subj)  # NOT the generic dir-list boilerplate
+        self.assertRegex(subj, r"^chore\(msgfix\): learnings: ")
+
+    def test_message_given_appends_learning_topics(self):
+        """A caller --message keeps its title AND gains a compact learnings suffix."""
+        repo = _init_repo(self._mk("suffix"))
+        os.makedirs(os.path.join(repo, "learnings"))
+        with open(os.path.join(repo, "learnings", "gamma.md"),
+                  "w", encoding="utf-8") as f:
+            f.write("# gamma\n")
+        _run(repo, "add", "-A")
+        code, out, err = run_cli(
+            ["kb-git", "commit", "--path", repo, "--type", "feat",
+             "--tag", "msgfix", "--message", "my feature title"], repo)
+        self.assertEqual(code, 0, err)
+        subj = _head_subject(repo)
+        self.assertTrue(subj.startswith("feat(msgfix): my feature title"))
+        self.assertIn("gamma", subj)
+        self.assertRegex(subj, r"^(feat|chore)\([a-z0-9._-]+\): .+")
+
+    def test_no_knowledge_falls_back_to_dir_list(self):
+        """No knowledge entries -> graceful fallback to the dir-list summary (C-2)."""
+        repo = _init_repo(self._mk("fallback"))
+        os.makedirs(os.path.join(repo, "references"))
+        with open(os.path.join(repo, "references", "x.md"),
+                  "w", encoding="utf-8") as f:
+            f.write("ref\n")
+        code, out, err = run_cli(
+            ["kb-git", "commit", "--path", repo, "--tag", "msgfix"], repo)
+        self.assertEqual(code, 0, err)
+        subj = _head_subject(repo)
+        self.assertIn("sync", subj)
+        self.assertIn("references", subj)
+        self.assertRegex(subj, r"^(feat|chore)\([a-z0-9._-]+\): .+")
+
+    def test_overlong_inputs_truncate_to_one_valid_subject(self):
+        """Many topics -> capped (+N more) AND clamped to one valid subject line."""
+        repo = _init_repo(self._mk("trunc"))
+        os.makedirs(os.path.join(repo, "learnings"))
+        for i in range(12):
+            with open(os.path.join(repo, "learnings", "t%02d.md" % i),
+                      "w", encoding="utf-8") as f:
+                f.write("x\n")
+        _run(repo, "add", "-A")
+        code, out, err = run_cli(
+            ["kb-git", "commit", "--path", repo, "--tag", "msgfix"], repo)
+        self.assertEqual(code, 0, err)
+        subj = _head_subject(repo)
+        self.assertLessEqual(len(subj), 100)            # one sane line (C-1)
+        self.assertNotIn("\n", subj)
+        self.assertIn("more", subj)                     # tail collapsed to +N more
+        self.assertRegex(subj, r"^chore\(msgfix\): learnings: ")
+
     def test_c3_refuses_package_repo(self):
         # Simulate the target resolving to the agentware package repo: point the
         # module's REPO_ROOT at the SAME repo as the target so the C-3 toplevel

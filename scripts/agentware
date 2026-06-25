@@ -61,16 +61,24 @@ LOGS_SESSIONS_REL = os.path.join("logs", "sessions")
 GITIGNORE_REL = ".gitignore"
 
 # The KB .gitignore `init` scaffolds. `logs/` holds full session transcripts and
-# is local-only: with KB autocommit ON by default, every run would otherwise
-# commit+push transcripts to the remote (bloat + an unwanted disclosure for a
-# security-first operator). Ignoring + untracking `logs/` keeps autocommit to
-# KNOWLEDGE only (learnings, index, scorecard, MAIN) — never transcripts.
+# `.loop/` holds ephemeral per-feature loop state (iteration counters, .done,
+# live-stream.log); both are local-only run state. With KB autocommit ON by
+# default, every run would otherwise commit+push them to the remote (bloat + an
+# unwanted disclosure for a security-first operator). Ignoring + untracking them
+# keeps autocommit to KNOWLEDGE only (learnings, index, scorecard, MAIN).
 KB_GITIGNORE_MARKER = "logs/"
+# Required rules an existing KB's .gitignore must contain — compared normalized
+# (stripped, trailing-slash removed) and appended if missing by _ensure_kb_gitignore.
+KB_GITIGNORE_REQUIRED = ("logs", ".loop")
 KB_GITIGNORE_CONTENT = (
     "# agentware knowledge base — ignored paths (scaffolded by `agentware init`)\n"
     "# Session transcripts/logs are local-only: NEVER committed or pushed. KB\n"
     "# autocommit only ever versions knowledge (learnings, index, scorecard, MAIN).\n"
     "logs/\n"
+    "\n"
+    "# Ephemeral per-feature loop state (iteration counters, .done, live-stream.log).\n"
+    "# Local-only run state — never committed/pushed, like logs/.\n"
+    ".loop/\n"
     "\n"
     "# OS / editor / tooling noise\n"
     ".DS_Store\n"
@@ -718,12 +726,16 @@ def _write_config(kdir):
 
 
 def _ensure_kb_gitignore(kdir):
-    """Ensure the KB `.gitignore` exists and ignores `logs/` (transcripts).
+    """Ensure the KB `.gitignore` exists and ignores local-only run state.
+
+    Ignored: `logs/` (session transcripts) and `.loop/` (ephemeral per-feature
+    loop state — iteration counters, .done, live-stream.log). Both are local-only
+    and must never be committed/pushed.
 
     Idempotent: creates the file with the standard content if absent; if a
-    `.gitignore` already exists but has no `logs/` rule, appends one (so an
-    existing KB scaffolded before this rule still gets transcripts excluded).
-    Returns 'created' | 'appended' | 'kept' describing what it did.
+    `.gitignore` already exists but is missing a required rule (`logs/` or
+    `.loop/`), appends the missing one(s) — so a KB scaffolded before a rule was
+    added still gets it. Returns 'created' | 'appended' | 'kept'.
     """
     path = os.path.join(kdir, GITIGNORE_REL)
     if not os.path.exists(path):
@@ -732,15 +744,16 @@ def _ensure_kb_gitignore(kdir):
         return "created"
     with open(path, "r", encoding="utf-8") as f:
         existing = f.read()
-    # A bare `logs/` line (ignoring surrounding whitespace) means it's covered.
-    has_rule = any(ln.strip().rstrip("/") == "logs"
-                   for ln in existing.splitlines())
-    if has_rule:
+    # Normalize each line (strip whitespace + trailing slash) so a bare `logs/`
+    # or `.loop/` rule is recognized regardless of surrounding formatting.
+    present = set(ln.strip().rstrip("/") for ln in existing.splitlines())
+    missing = [rule for rule in KB_GITIGNORE_REQUIRED if rule not in present]
+    if not missing:
         return "kept"
     sep = "" if existing.endswith("\n") or existing == "" else "\n"
     with open(path, "a", encoding="utf-8") as f:
-        f.write(sep + "\n# Session transcripts/logs are local-only "
-                "(added by agentware).\n" + KB_GITIGNORE_MARKER + "\n")
+        f.write(sep + "\n# Local-only run state (added by agentware).\n"
+                + "".join(rule + "/\n" for rule in missing))
     return "appended"
 
 
@@ -813,8 +826,8 @@ def cmd_init(args):
         print("  index:  %s%s" % (ipath, " (seeded)" if seeded else " (kept)"))
         print("  config: %s" % HOME_CONFIG)
         print("  work:   %s/work/<feature>/   logs: %s/logs/" % (kdir, kdir))
-        print("  .gitignore: %s (logs/ excluded — transcripts never committed)"
-              % gitignore_action)
+        print("  .gitignore: %s (logs/ + .loop/ excluded — transcripts & loop "
+              "state never committed)" % gitignore_action)
         if installed_templates:
             print("  templates installed: %s" % ", ".join(installed_templates))
         print("Next: run onboarding (.claude/skills/onboarding/SKILL.md) to "
@@ -4226,6 +4239,55 @@ def _sanitize_commit_tag(tag):
 # Conventional-commit subject the auto-commit must satisfy: feat|chore(scope): msg
 COMMIT_MSG_RE = re.compile(r"^(feat|chore)\([a-z0-9._-]+\): .+")
 
+# A commit subject stays one sane line; cap its total length (C-1) and truncate
+# with an ellipsis rather than spill the dir list / topic list across the line.
+COMMIT_SUBJECT_MAX = 100
+# How many knowledge topics to name before collapsing the tail to "+N more".
+COMMIT_TOPICS_LIMIT = 5
+
+
+def kb_changed_knowledge_topics(changed):
+    """Knowledge entry 'topics' (basenames) among the changed paths.
+
+    `learnings/<topic>.md` -> `<topic>`; `skills/<topic>/...` or
+    `skills/<topic>.md` -> `<topic>`. De-duplicated, sorted, deterministic — used
+    to make the autocommit subject name WHAT knowledge changed instead of the
+    generic top-level dir list. Pure string ops over the staged diff (no LLM /
+    network), so the moat is preserved (feature 260625-autocommit-message-fix).
+    """
+    seen = set()
+    for p in changed:
+        parts = p.split("/")
+        if len(parts) < 2:
+            continue  # top-level file (MAIN.md, index.json) — not a knowledge entry
+        topic = None
+        if parts[0] == "learnings" and parts[-1].endswith(".md"):
+            topic = parts[-1][:-3]
+        elif parts[0] == "skills":
+            seg = parts[1]
+            topic = seg[:-3] if seg.endswith(".md") else seg
+        if topic:
+            seen.add(topic)
+    return sorted(seen)
+
+
+def _format_topics_label(topics, limit=COMMIT_TOPICS_LIMIT):
+    """`learnings: a, b, c` (first `limit`, tail collapsed to `+N more`)."""
+    shown = topics[:limit]
+    label = ", ".join(shown)
+    extra = len(topics) - len(shown)
+    if extra > 0:
+        label += ", +%d more" % extra
+    return "learnings: %s" % label
+
+
+def _truncate_subject(subject, limit=COMMIT_SUBJECT_MAX):
+    """Clamp a commit subject to one sane line ≤ `limit` chars (C-1)."""
+    subject = subject.splitlines()[0] if subject else subject
+    if len(subject) > limit:
+        subject = subject[:limit - 3].rstrip().rstrip(",") + "..."
+    return subject
+
 
 def cmd_kb_git_commit(args):
     """Stage + commit ONLY the knowledge-base repo as one conventional commit.
@@ -4274,13 +4336,25 @@ def cmd_kb_git_commit(args):
     tag = _sanitize_commit_tag(getattr(args, "tag", None))
     ctype = getattr(args, "type", None) or "chore"
     message = getattr(args, "message", None)
+    # Name WHAT knowledge changed (deterministic, from the staged diff). Used as
+    # the default summary, or appended as a compact suffix to a caller --message.
+    topics = kb_changed_knowledge_topics(changed)
     if not message:
-        tops = sorted({p.split("/", 1)[0] for p in changed})
-        n = len(changed)
-        message = "sync %s (%d file%s)" % (
-            ", ".join(tops), n, "" if n == 1 else "s")
+        if topics:
+            # Default summary describes the changed knowledge entries...
+            message = _format_topics_label(topics)
+        else:
+            # ...else fall back to the changed top-level dir list (C-2, never empty).
+            tops = sorted({p.split("/", 1)[0] for p in changed})
+            n = len(changed)
+            message = "sync %s (%d file%s)" % (
+                ", ".join(tops), n, "" if n == 1 else "s")
+    elif topics:
+        # A caller-supplied title (e.g. the plan title from agentware.sh) gets a
+        # compact knowledge suffix so the subject names BOTH feature + knowledge.
+        message = "%s — %s" % (message, _format_topics_label(topics))
 
-    subject = "%s(%s): %s" % (ctype, tag, message)
+    subject = _truncate_subject("%s(%s): %s" % (ctype, tag, message))
     if not COMMIT_MSG_RE.match(subject):
         sys.stderr.write(
             "kb-git commit: refusing — message '%s' does not match "
