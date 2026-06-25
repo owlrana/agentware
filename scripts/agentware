@@ -325,6 +325,111 @@ def entry_last_verified(entry):
     return entry.get("created")
 
 
+# --- ACR: Authority/Confidence Re-ranking prior (provenance + freshness) -----
+# A deterministic, gentle, bounded per-entry multiplier blended onto BM25
+# relevance (`final = bm25_relevance × acr(entry, as_of)`). Pure stdlib, no
+# LLM/RNG/network: acr is a pure function of `(entry, as_of)` so at a FIXED
+# `as_of` the ranking is byte-identical across runs (INV-1). `as_of` is an
+# EXPLICIT parameter (never a hidden wall-clock) so determinism is preserved;
+# it defaults to today only at the CLI boundary and is PINNED in tests/eval.
+#
+# All constants below are tunable starting points (the win gate in Phase 3
+# treats MARGIN/H/FLOOR/source-weights/alpha as parameters).
+ACR_SOURCE_WEIGHTS = {"user": 1.0, "agent": 0.9, "imported": 0.8}
+# Unattributed/legacy entries (no `source` frontmatter) are treated as
+# agent-authored — a gentle middle weight, never the top "user" tier.
+ACR_DEFAULT_SOURCE_WEIGHT = 0.9
+ACR_HALF_LIFE_DAYS = 90          # confidence half-life: freshness halves every H days
+ACR_FRESHNESS_FLOOR = 0.85       # a still-true old fact is never buried below this
+
+
+def source_weight(source):
+    """Provenance prior for an entry's `source`. user > agent > imported.
+
+    Unknown/missing/empty source falls back to ACR_DEFAULT_SOURCE_WEIGHT so
+    legacy entries are never harshly penalized. Deterministic, stdlib-only.
+    """
+    if isinstance(source, str):
+        key = source.strip().lower()
+        if key in ACR_SOURCE_WEIGHTS:
+            return ACR_SOURCE_WEIGHTS[key]
+    return ACR_DEFAULT_SOURCE_WEIGHT
+
+
+def freshness(last_verified, as_of, half_life=ACR_HALF_LIFE_DAYS,
+              floor=ACR_FRESHNESS_FLOOR):
+    """Read-time half-life decay of confidence, gently floored.
+
+    `freshness = max(floor, 0.5 ** (age_days / half_life))` where
+    `age_days = max(0, as_of - last_verified)`. A future `last_verified`
+    (negative age) is clamped to age 0 → 1.0 (never boosts above fresh). An
+    unknown/invalid `last_verified` returns `floor` (treated as oldest, but
+    only the gentle floor penalty). Pure function of the two dates; no clock.
+    """
+    import datetime
+    if not _is_valid_date(as_of):
+        raise ValueError("as_of must be a YYYY-MM-DD date, got %r" % (as_of,))
+    if not _is_valid_date(last_verified):
+        return floor
+    lv = datetime.date.fromisoformat(last_verified)
+    now = datetime.date.fromisoformat(as_of)
+    age_days = (now - lv).days
+    if age_days <= 0:
+        return 1.0
+    return max(floor, 0.5 ** (age_days / float(half_life)))
+
+
+def acr(entry, as_of):
+    """Authority/Confidence prior = source_weight × freshness, in [floor*0.8, 1.0].
+
+    Pure, deterministic, bounded. Reuses `entry_last_verified` (which falls back
+    to `created`) for the freshness date — no second freshness accessor. Never
+    mutates `entry` (INV-2). `as_of` is explicit and required.
+    """
+    if not isinstance(entry, dict):
+        raise ValueError("acr expects an entry dict, got %r" % (type(entry),))
+    sw = source_weight(entry.get("source"))
+    fr = freshness(entry_last_verified(entry), as_of)
+    return sw * fr
+
+
+def date_age_days(date_str, as_of):
+    """Age in whole days of `date_str` as-of `as_of`, clamped ≥0.
+
+    Pure function of two YYYY-MM-DD dates (no clock). A future date (negative
+    age) clamps to 0. Returns None when either date is invalid/missing — used
+    by the age-stratified slice in the ACR win gate, NOT by ranking, so an
+    unknown answer date simply drops out of the stratum rather than skewing it.
+    """
+    if not _is_valid_date(as_of) or not _is_valid_date(date_str):
+        return None
+    import datetime
+    age = (datetime.date.fromisoformat(as_of)
+           - datetime.date.fromisoformat(date_str)).days
+    return max(0, age)
+
+
+def answer_age_days(entries_by_id, expected_ids, as_of):
+    """Representative age (days) of a gold query's correct answer, as-of `as_of`.
+
+    For the age-stratified no-regression guard (Phase 3.2): split gold queries
+    into OLD-answer vs RECENT-answer strata. When a query has several correct
+    answers we take the OLDEST present one (max age) so a query counts as
+    OLD-stratum if ANY of its correct answers is old — the conservative choice
+    that catches ACR "winning" only by burying still-true old facts. Returns
+    None when no expected entry resolves to a valid date (excluded from slices).
+    """
+    ages = []
+    for eid in expected_ids:
+        entry = entries_by_id.get(eid)
+        if not isinstance(entry, dict):
+            continue
+        age = date_age_days(entry_last_verified(entry), as_of)
+        if age is not None:
+            ages.append(age)
+    return max(ages) if ages else None
+
+
 def _entry_key(entry):
     return (entry.get("category") or "", entry.get("id") or "")
 
@@ -1992,20 +2097,54 @@ def retrieve_bm25(kdir, data, query, top_k=None):
     return ids if top_k is None else ids[:top_k]
 
 
-def recall_ranked(kdir, data, query, top_k=None, category=None):
-    """Deterministic BM25 recall returning [(entry, score, doc_text), ...].
+def retrieve_bm25_acr(kdir, data, query, as_of, top_k=None):
+    """ACR-reranked BM25: `final = bm25_relevance × acr(entry, as_of)`.
 
-    Reuses the shared `build_corpus` + `bm25_scores` so ordering is byte-identical
-    to `retrieve_bm25`: score desc -> created desc -> id asc, positive scores only.
-    An optional `category` restricts the corpus BEFORE scoring. Read-only (INV-2);
-    no network/LLM/embeddings (INV-1, INV-6). `doc_text` is the entry's full
-    corpus document (title+summary+tags+body) for token-footprint estimation.
+    Surfaces the EXACT same set as `retrieve_bm25` — relevance gates: only
+    positive-BM25 entries enter, and the acr multiplier is bounded in (0, 1] so it
+    can never lift a zero-score (non-matching) entry into the result (C-3). The
+    surfaced set is merely RE-ORDERED by the ACR-weighted score under the SAME
+    deterministic tie-break (score desc -> created desc -> id asc). acr is a pure
+    function of `(entry, as_of)`, so at a FIXED `as_of` the ordering is
+    byte-identical across runs (INV-1). Read-only (INV-2); stdlib only, no
+    network/LLM/embeddings.
     """
+    corpus = build_corpus(kdir, data)
+    scored = [(e, s * acr(e, as_of))
+              for (e, s) in bm25_scores(corpus, tokenize(query)) if s > 0.0]
+    # Stable multi-pass sort: lowest priority first, highest priority last.
+    scored.sort(key=lambda es: es[0].get("id") or "")                       # id asc
+    scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)    # created desc
+    scored.sort(key=lambda es: es[1], reverse=True)                         # score desc
+    ids = [e.get("id") for (e, _s) in scored]
+    return ids if top_k is None else ids[:top_k]
+
+
+def recall_ranked(kdir, data, query, top_k=None, category=None,
+                  strategy="bm25", as_of=None):
+    """Deterministic ranked recall returning [(entry, score, doc_text), ...].
+
+    `strategy="bm25"` (default) reuses the shared `build_corpus` + `bm25_scores`
+    so ordering is byte-identical to `retrieve_bm25`: score desc -> created desc
+    -> id asc, positive scores only. `strategy="bm25+acr"` multiplies each BM25
+    score by `acr(entry, as_of)` (provenance × freshness prior) and re-sorts under
+    the SAME tie-break — same surfaced set (relevance gates; acr ∈ (0,1]), merely
+    reordered. `as_of` defaults to today only at this boundary; PIN it for
+    reproducible runs. An optional `category` restricts the corpus BEFORE scoring.
+    Read-only (INV-2); no network/LLM/embeddings (INV-1, INV-6). `doc_text` is the
+    entry's full corpus document (title+summary+tags+body) for token estimation.
+    """
+    if strategy not in ("bm25", "bm25+acr"):
+        raise ValueError("unknown recall strategy: %s" % strategy)
     corpus = build_corpus(kdir, data)
     if category:
         corpus = [(e, t) for (e, t) in corpus if e.get("category") == category]
     text_by_id = {e.get("id"): t for (e, t) in corpus}
     scored = [(e, s) for (e, s) in bm25_scores(corpus, tokenize(query)) if s > 0.0]
+    if strategy == "bm25+acr":
+        if as_of is None:
+            as_of = _today()
+        scored = [(e, s * acr(e, as_of)) for (e, s) in scored]
     # Stable multi-pass sort: lowest priority first, highest priority last.
     scored.sort(key=lambda es: es[0].get("id") or "")                       # id asc
     scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)    # created desc
@@ -2015,12 +2154,17 @@ def recall_ranked(kdir, data, query, top_k=None, category=None):
     return [(e, s, text_by_id.get(e.get("id"), "")) for (e, s) in scored]
 
 
-def retrieve(kdir, data, query, strategy, top_k=None):
+def retrieve(kdir, data, query, strategy, top_k=None, as_of=None):
     """Dispatch to a retrieval strategy. Returns a ranked list of entry ids.
 
-    'tag'  — the legacy exact-tag baseline (available from day one).
-    'bm25' — the deterministic BM25 recall engine (provided by Phase 1 as the
-             module-level `retrieve_bm25`); errors clearly until that lands.
+    'tag'      — the legacy exact-tag baseline (available from day one).
+    'bm25'     — the deterministic BM25 recall engine (provided by Phase 1 as the
+                 module-level `retrieve_bm25`); errors clearly until that lands.
+    'bm25+acr' — BM25 relevance re-weighted by the ACR provenance+freshness prior
+                 (`final = bm25 × acr(entry, as_of)`). `as_of` defaults to today
+                 only here; PIN it (eval/tests) for reproducible, byte-identical
+                 ordering (INV-1). Surfaces the SAME set as 'bm25' (relevance
+                 gates), merely reordered (C-3 — plain 'bm25' stays untouched).
     """
     if strategy == "tag":
         return retrieve_tag(kdir, data, query, top_k)
@@ -2031,6 +2175,10 @@ def retrieve(kdir, data, query, strategy, top_k=None):
                 "the 'bm25' strategy requires the recall engine (Phase 1); "
                 "use --strategy tag for the baseline")
         return fn(kdir, data, query, top_k)
+    if strategy == "bm25+acr":
+        if as_of is None:
+            as_of = _today()
+        return retrieve_bm25_acr(kdir, data, query, as_of, top_k)
     raise ValueError("unknown retrieval strategy: %s" % strategy)
 
 
@@ -2120,21 +2268,25 @@ def load_gold(path):
     return items, None
 
 
-def evaluate(kdir, data, gold, strategy, top_k):
+def evaluate(kdir, data, gold, strategy, top_k, as_of=None):
     """Run the gold set through a strategy and compute graded metrics.
 
     Returns a dict with aggregate `metrics` + `per_query` rows. Read-only.
     Latency uses time.perf_counter and is the ONLY non-deterministic field; the
-    ranking itself is deterministic (INV-1).
+    ranking itself is deterministic (INV-1). `as_of` is threaded to `retrieve` so
+    the `bm25+acr` strategy decays freshness at a PINNED date (reproducible).
     """
-    docs_by_id = {e.get("id"): doc for e, doc in build_corpus(kdir, data)}
+    corpus = build_corpus(kdir, data)
+    docs_by_id = {e.get("id"): doc for e, doc in corpus}
+    entries_by_id = {e.get("id"): e for e, doc in corpus}
+    as_of_for_age = as_of or _today()
     per_query = []
     recalls, precisions, ndcgs, rrs, latencies, footprints = [], [], [], [], [], []
     for row in gold:
         query = row["query"]
         relevant = set(row["expected_ids"])
         t0 = time.perf_counter()
-        ranked = retrieve(kdir, data, query, strategy, top_k=None)
+        ranked = retrieve(kdir, data, query, strategy, top_k=None, as_of=as_of)
         latency_ms = (time.perf_counter() - t0) * 1000.0
         topk = ranked[:top_k]
         rec = recall_at_k(ranked, relevant, top_k)
@@ -2158,6 +2310,11 @@ def evaluate(kdir, data, gold, strategy, top_k):
             "reciprocal_rank": rr,
             "latency_ms": latency_ms,
             "context_tokens": footprint,
+            # Age (days) of the correct answer as-of the PINNED date — drives the
+            # OLD vs RECENT stratum in the ACR win gate (Phase 3.2). Pure
+            # date-math, deterministic at a fixed `as_of`; None ⇒ excluded.
+            "answer_age_days": answer_age_days(entries_by_id, relevant,
+                                               as_of_for_age),
         })
     n = len(gold)
     mean = lambda xs: (sum(xs) / len(xs)) if xs else 0.0
@@ -2184,16 +2341,18 @@ _ABLATE_METRIC_KEYS = (
 )
 
 
-def evaluate_ablation(kdir, data, gold, top_k, baseline="tag", treatment="bm25"):
+def evaluate_ablation(kdir, data, gold, top_k, baseline="tag", treatment="bm25",
+                      as_of=None):
     """Run the SAME gold set through two strategies and report the per-metric lift.
 
-    Proof-of-lift instrument (Phase 3.2): scores the legacy tag-only baseline and
-    the new BM25 treatment over identical queries, then reports `treatment -
-    baseline` for every headline metric. Read-only (INV-2); ranking is
+    Proof-of-lift instrument (Phase 3.2): scores the `baseline` and `treatment`
+    strategies over identical queries, then reports `treatment - baseline` for
+    every headline metric. `as_of` is threaded to both runs so an ACR treatment
+    (`bm25+acr`) decays at a PINNED date. Read-only (INV-2); ranking is
     deterministic (INV-1) so the delta is reproducible (latency excepted).
     """
-    base = evaluate(kdir, data, gold, baseline, top_k)
-    treat = evaluate(kdir, data, gold, treatment, top_k)
+    base = evaluate(kdir, data, gold, baseline, top_k, as_of=as_of)
+    treat = evaluate(kdir, data, gold, treatment, top_k, as_of=as_of)
     delta = {}
     for key in _ABLATE_METRIC_KEYS:
         delta[key] = treat["metrics"][key] - base["metrics"][key]
@@ -2211,6 +2370,198 @@ def evaluate_ablation(kdir, data, gold, top_k, baseline="tag", treatment="bm25")
         "per_query": {
             baseline: base["per_query"],
             treatment: treat["per_query"],
+        },
+    }
+
+
+# --- ACR win gate (Phase 3.2): deterministic 5-part decision rule ------------
+# `eval --acr-gate` decides whether `bm25+acr` should become the DEFAULT ranking.
+# ALL five checks must hold: (1) mean nDCG@k lift >= MARGIN; (2) paired t-test on
+# per-query nDCG deltas significant at alpha (|t| >= t_crit, df=n-1); (3) win-rate
+# (queries improved > regressed); (4) no-harm guardrails (Recall@k, MRR, p50
+# latency, byte-identical determinism); (5) age-stratified no-regression on the
+# OLD-answer stratum (ACR must not "win" only by burying still-true old facts).
+# Pure stdlib — NO scipy: the t-test uses a critical-value TABLE (not a continuous
+# CDF). Deterministic given the ablation result (computed at a PINNED `as_of`) plus
+# a determinism flag, so the same inputs always yield the same verdict.
+ACR_GATE_MARGIN = 0.01             # min mean nDCG@k lift (treatment - baseline)
+ACR_GATE_ALPHA = 0.05              # paired t-test two-tailed significance level
+ACR_GATE_RECALL_EPS = 0.0          # Recall@k no-harm slack (treat >= base - eps)
+ACR_GATE_MRR_EPS = 0.0             # MRR no-harm slack (treat >= base - eps)
+ACR_GATE_LATENCY_BUDGET_MS = 10.0  # p50 latency slack (treat_p50 <= base_p50 + budget)
+ACR_GATE_OLD_AGE_DAYS = 90         # answer_age_days >= this => OLD-answer stratum
+ACR_GATE_STRATUM_EPS = 1e-9        # OLD-stratum nDCG no-regression slack
+
+# Two-tailed Student-t critical values, keyed by df, for alpha in {0.05, 0.01}.
+# For a df BETWEEN tabulated rows we use the largest tabulated df <= our df, which
+# is CONSERVATIVE (a smaller df => a larger critical value => a stricter gate).
+# A df above the table uses the normal-approx asymptote (df -> inf).
+_T_CRIT = {
+    0.05: {1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571, 6: 2.447,
+           7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228, 11: 2.201, 12: 2.179,
+           13: 2.160, 14: 2.145, 15: 2.131, 16: 2.120, 17: 2.110, 18: 2.101,
+           19: 2.093, 20: 2.086, 21: 2.080, 22: 2.074, 23: 2.069, 24: 2.064,
+           25: 2.060, 26: 2.056, 27: 2.052, 28: 2.048, 29: 2.045, 30: 2.042,
+           40: 2.021, 50: 2.009, 60: 2.000, 80: 1.990, 100: 1.984, 120: 1.980},
+    0.01: {1: 63.657, 2: 9.925, 3: 5.841, 4: 4.604, 5: 4.032, 6: 3.707,
+           7: 3.499, 8: 3.355, 9: 3.250, 10: 3.169, 11: 3.106, 12: 3.055,
+           13: 3.012, 14: 2.977, 15: 2.947, 16: 2.921, 17: 2.898, 18: 2.878,
+           19: 2.861, 20: 2.845, 21: 2.831, 22: 2.819, 23: 2.807, 24: 2.797,
+           25: 2.787, 26: 2.779, 27: 2.771, 28: 2.763, 29: 2.756, 30: 2.750,
+           40: 2.704, 50: 2.678, 60: 2.660, 80: 2.639, 100: 2.626, 120: 2.617},
+}
+_T_CRIT_INF = {0.05: 1.960, 0.01: 2.576}
+
+
+def t_critical(df, alpha=ACR_GATE_ALPHA):
+    """Two-tailed Student-t critical value from a table (stdlib, no scipy).
+
+    For a df not tabulated we pick the largest tabulated df <= our df, which is
+    CONSERVATIVE (smaller df => larger critical value => harder to pass). A df
+    above the table uses the normal-approx asymptote. Raises ValueError for an
+    unsupported alpha or df < 1.
+    """
+    table = _T_CRIT.get(alpha)
+    if table is None:
+        raise ValueError("t_critical: unsupported alpha %r (have %s)"
+                         % (alpha, sorted(_T_CRIT)))
+    if df < 1:
+        raise ValueError("t_critical: df must be >= 1, got %r" % (df,))
+    keys = sorted(table)
+    if df > keys[-1]:
+        return _T_CRIT_INF[alpha]
+    chosen = keys[0]
+    for k in keys:
+        if k <= df:
+            chosen = k
+        else:
+            break
+    return table[chosen]
+
+
+def paired_t_test(deltas):
+    """Paired t-test on per-query deltas (treatment - baseline). Pure stdlib.
+
+    Returns {n, df, mean, sd, se, t}. The t-statistic is mean / (sd / sqrt(n))
+    with df = n - 1 and sd the sample (ddof=1) standard deviation. Degenerate
+    cases: n < 2 => t = 0, df = 0 (cannot test); sd == 0 => t = 0 when the mean
+    is 0, else +/-inf (a perfectly consistent non-zero shift). Deterministic.
+    """
+    n = len(deltas)
+    if n == 0:
+        return {"n": 0, "df": 0, "mean": 0.0, "sd": 0.0, "se": 0.0, "t": 0.0}
+    mean = sum(deltas) / n
+    if n < 2:
+        return {"n": n, "df": 0, "mean": mean, "sd": 0.0, "se": 0.0, "t": 0.0}
+    var = sum((d - mean) ** 2 for d in deltas) / (n - 1)
+    sd = math.sqrt(var)
+    se = sd / math.sqrt(n)
+    if se == 0.0:
+        t = 0.0 if mean == 0.0 else math.copysign(float("inf"), mean)
+    else:
+        t = mean / se
+    return {"n": n, "df": n - 1, "mean": mean, "sd": sd, "se": se, "t": t}
+
+
+def acr_gate_decision(ablation, margin=ACR_GATE_MARGIN, alpha=ACR_GATE_ALPHA,
+                      recall_eps=ACR_GATE_RECALL_EPS, mrr_eps=ACR_GATE_MRR_EPS,
+                      latency_budget_ms=ACR_GATE_LATENCY_BUDGET_MS,
+                      old_age_days=ACR_GATE_OLD_AGE_DAYS,
+                      stratum_eps=ACR_GATE_STRATUM_EPS, determinism_ok=False):
+    """Apply the deterministic 5-part ACR win gate to a bm25-vs-bm25+acr ablation.
+
+    `ablation` is an `evaluate_ablation` result (baseline + treatment headline
+    metrics + per-query nDCG and `answer_age_days` on each row). ALL five checks
+    must hold for `passed`. Pure given (ablation, determinism_ok): the only
+    externally-measured input is `determinism_ok` (the bm25+acr twin-run equality
+    at the pinned `as_of`), passed in so this stays a pure, table-driven function.
+    """
+    base_name = ablation.get("baseline")
+    treat_name = ablation.get("treatment")
+    strategies = ablation.get("strategies", {})
+    base_m = strategies.get(base_name, {})
+    treat_m = strategies.get(treat_name, {})
+    pq = ablation.get("per_query", {})
+    base_pq = pq.get(base_name, [])
+    treat_pq = pq.get(treat_name, [])
+
+    # Per-query nDCG deltas (aligned by gold order).
+    deltas = [t.get("ndcg_at_k", 0.0) - b.get("ndcg_at_k", 0.0)
+              for b, t in zip(base_pq, treat_pq)]
+
+    # 1. Primary: mean nDCG@k lift >= margin.
+    delta_ndcg = treat_m.get("ndcg_at_k", 0.0) - base_m.get("ndcg_at_k", 0.0)
+    primary_ok = delta_ndcg >= margin
+
+    # 2. Significance: paired t-test, lift in the right direction AND |t| >= t_crit.
+    tt = paired_t_test(deltas)
+    tcrit = t_critical(tt["df"], alpha) if tt["df"] >= 1 else float("inf")
+    sig_ok = tt["df"] >= 1 and tt["mean"] > 0.0 and tt["t"] >= tcrit
+
+    # 3. Win-rate (descriptive sign check): improved > regressed.
+    improved = sum(1 for d in deltas if d > 0)
+    regressed = sum(1 for d in deltas if d < 0)
+    ties = sum(1 for d in deltas if d == 0)
+    winrate_ok = improved > regressed
+
+    # 4. No-harm guardrails: Recall@k, MRR, p50 latency, determinism.
+    recall_ok = (treat_m.get("recall_at_k", 0.0)
+                 >= base_m.get("recall_at_k", 0.0) - recall_eps)
+    mrr_ok = treat_m.get("mrr", 0.0) >= base_m.get("mrr", 0.0) - mrr_eps
+    latency_ok = (treat_m.get("latency_ms_p50", 0.0)
+                  <= base_m.get("latency_ms_p50", 0.0) + latency_budget_ms)
+    no_harm_ok = recall_ok and mrr_ok and latency_ok and bool(determinism_ok)
+
+    # 5. Age-stratified no-regression on the OLD-answer stratum.
+    old_base, old_treat = [], []
+    for b, t in zip(base_pq, treat_pq):
+        age = b.get("answer_age_days")
+        if isinstance(age, (int, float)) and not isinstance(age, bool) \
+                and age >= old_age_days:
+            old_base.append(b.get("ndcg_at_k", 0.0))
+            old_treat.append(t.get("ndcg_at_k", 0.0))
+    old_n = len(old_base)
+    _mean = lambda xs: (sum(xs) / len(xs)) if xs else 0.0
+    old_base_ndcg = _mean(old_base)
+    old_treat_ndcg = _mean(old_treat)
+    # Vacuously passes when the stratum is empty (recorded via old_count).
+    stratum_ok = (old_n == 0) or (old_treat_ndcg >= old_base_ndcg - stratum_eps)
+
+    passed = bool(primary_ok and sig_ok and winrate_ok and no_harm_ok
+                  and stratum_ok)
+    return {
+        "passed": passed,
+        "baseline": base_name,
+        "treatment": treat_name,
+        "params": {"margin": margin, "alpha": alpha, "recall_eps": recall_eps,
+                   "mrr_eps": mrr_eps, "latency_budget_ms": latency_budget_ms,
+                   "old_age_days": old_age_days, "stratum_eps": stratum_eps},
+        "checks": {
+            "primary": {"passed": bool(primary_ok), "delta_ndcg": delta_ndcg,
+                        "margin": margin},
+            "significance": {"passed": bool(sig_ok), "t": tt["t"], "df": tt["df"],
+                             "t_crit": tcrit, "mean_delta": tt["mean"],
+                             "n": tt["n"], "alpha": alpha},
+            "win_rate": {"passed": bool(winrate_ok), "improved": improved,
+                         "regressed": regressed, "ties": ties},
+            "no_harm": {
+                "passed": bool(no_harm_ok),
+                "recall": {"passed": bool(recall_ok),
+                           "baseline": base_m.get("recall_at_k"),
+                           "treatment": treat_m.get("recall_at_k")},
+                "mrr": {"passed": bool(mrr_ok), "baseline": base_m.get("mrr"),
+                        "treatment": treat_m.get("mrr")},
+                "latency_p50": {"passed": bool(latency_ok),
+                                "baseline": base_m.get("latency_ms_p50"),
+                                "treatment": treat_m.get("latency_ms_p50"),
+                                "budget_ms": latency_budget_ms},
+                "determinism_ok": bool(determinism_ok),
+            },
+            "age_stratum": {"passed": bool(stratum_ok), "old_count": old_n,
+                            "old_ndcg_baseline": old_base_ndcg,
+                            "old_ndcg_treatment": old_treat_ndcg,
+                            "recent_count": len(deltas) - old_n,
+                            "old_age_days": old_age_days},
         },
     }
 
@@ -2301,6 +2652,19 @@ def _determinism_check(kdir, data, gold, top_k):
     """
     a = evaluate(kdir, data, gold, "bm25", top_k)["per_query"]
     b = evaluate(kdir, data, gold, "bm25", top_k)["per_query"]
+    return [q["ranked"] for q in a] == [q["ranked"] for q in b]
+
+
+def _determinism_check_at(kdir, data, gold, top_k, strategy, as_of):
+    """Twin-run ranking-equality check for `strategy` at a PINNED `as_of` (INV-1).
+
+    Mirrors `_determinism_check` (which fixes strategy=bm25) but parameterized by
+    strategy + as_of so the ACR gate can assert `bm25+acr` is byte-identical
+    across runs at a fixed date (decay is a pure function of the two dates, no
+    clock). Latency excluded (the only non-deterministic field). Read-only.
+    """
+    a = evaluate(kdir, data, gold, strategy, top_k, as_of=as_of)["per_query"]
+    b = evaluate(kdir, data, gold, strategy, top_k, as_of=as_of)["per_query"]
     return [q["ranked"] for q in a] == [q["ranked"] for q in b]
 
 
@@ -2399,6 +2763,105 @@ def record_ledger(kdir, data, gold, gold_path, result, top_k):
     row = build_ledger_row(result, git_info(), utc_now_iso(), checks)
     append_ledger_row(os.path.join(kdir, HISTORY_REL), row)
     return row
+
+
+# --- ACR default-flip ledger (Phase 4.1) ------------------------------------
+# `eval --acr-gate --record` appends ONE immutable row (mode="acr-gate") that
+# captures the full 5-part decision + both strategies' metrics + the per-stratum
+# numbers. The recorded `strategy` field IS the resulting agent-facing default
+# (`bm25+acr` iff the gate PASSED, else `bm25`). `active_default_strategy(kdir)`
+# then reads that ledger so bare `recall` auto-inherits the decision — the flip
+# is data-driven (no steering/agent edits) and reproducible (a pure read of the
+# immutable ledger; at a fixed ledger + `as_of` recall is byte-identical, INV-1).
+
+ACR_GATE_MODE = "acr-gate"
+
+
+def build_acr_gate_row(result, decision, git_meta, run_ts, checks):
+    """Assemble one immutable `mode="acr-gate"` ledger row. Pure given inputs.
+
+    `strategy` is the DECIDED default (treatment iff the gate passed, else the
+    baseline), so `active_default_strategy` can resolve the agent default from a
+    single field. The full `decision` is stored verbatim as evidence (deltas,
+    t-stat, win-rate, no-harm, per-stratum). Volatile values (run_ts, latency,
+    git) are injected by the caller so a fixed decision serializes identically.
+    """
+    baseline = result["baseline"]
+    treatment = result["treatment"]
+    metrics = result["strategies"][treatment]
+    decided = treatment if decision.get("passed") else baseline
+    reliability = compute_reliability(
+        metrics.get("recall_at_k", 0.0), checks.get("test_pass_rate"),
+        checks.get("index_validate_ok", False),
+        checks.get("determinism_ok", False))
+    return {
+        "schema": LEDGER_SCHEMA,
+        "run": run_ts,
+        "commit": git_meta.get("commit", "unknown"),
+        "committed": git_meta.get("committed", ""),
+        "subject": git_meta.get("subject", ""),
+        "dirty": git_meta.get("dirty", False),
+        "mode": ACR_GATE_MODE,
+        "strategy": decided,
+        "top_k": result.get("top_k"),
+        "num_queries": result.get("num_queries"),
+        "gold_path": result.get("gold_path"),
+        "as_of": result.get("as_of"),
+        "metrics": metrics,
+        "ablation": {
+            "baseline": baseline,
+            "treatment": treatment,
+            "delta": result["delta"],
+        },
+        "acr_gate": {
+            "passed": bool(decision.get("passed")),
+            "decided_strategy": decided,
+            "params": decision.get("params"),
+            "checks": decision.get("checks"),
+        },
+        "checks": checks,
+        "reliability": reliability,
+    }
+
+
+def record_acr_gate(kdir, data, gold, gold_path, result, decision, top_k, as_of):
+    """Gather volatile state and append ONE acr-gate row. Read-only w.r.t. the KB.
+
+    Mirrors `record_ledger` but stamps the bm25+acr determinism check at the
+    PINNED `as_of` (INV-1) into the row's checks. Returns the appended row.
+    """
+    pass_rate, ran, failed = _record_test_passrate()
+    checks = {
+        "test_pass_rate": pass_rate,
+        "tests_ran": ran,
+        "tests_failed": failed,
+        "index_validate_ok": not validate_index(kdir, data),
+        "determinism_ok": _determinism_check_at(
+            kdir, data, gold, top_k, "bm25+acr", as_of),
+    }
+    row = build_acr_gate_row(result, decision, git_info(), utc_now_iso(), checks)
+    append_ledger_row(os.path.join(kdir, HISTORY_REL), row)
+    return row
+
+
+def active_default_strategy(kdir):
+    """Resolve the agent-facing default recall strategy from the ledger.
+
+    Returns "bm25+acr" iff the MOST RECENT recorded ACR-gate decision PASSED;
+    otherwise "bm25". No acr-gate row yet (fresh clone, or the live gate FAILED)
+    -> "bm25" — the honest, baseline-preserving default. Pure read of the
+    append-only ledger (INV-2); deterministic given the ledger state, so bare
+    `recall` is byte-identical at a fixed ledger + `as_of` (INV-1). This is the
+    auto-flip seam: agents call bare `recall` and inherit the gated default with
+    no steering/agent edits.
+    """
+    rows = _read_ledger(os.path.join(kdir, HISTORY_REL))
+    acr_rows = [r for r in rows if r.get("mode") == ACR_GATE_MODE]
+    if not acr_rows:
+        return "bm25"
+    latest = max(acr_rows, key=lambda r: r.get("run") or "")
+    gate = latest.get("acr_gate") or {}
+    return "bm25+acr" if gate.get("passed") else "bm25"
 
 
 # --- Regression gate (Phase 3B.2) -------------------------------------------
@@ -2654,6 +3117,91 @@ def cmd_bench(args):
     return 0
 
 
+def _ok(flag):
+    """PASS/FAIL token for a boolean check in --acr-gate text output."""
+    return "PASS" if flag else "FAIL"
+
+
+def _print_acr_gate(result, decision, as_of):
+    """Human-readable verdict for `eval --acr-gate` (text format)."""
+    c = decision["checks"]
+    print("eval --acr-gate: %s vs %s  top_k=%d  queries=%d  as_of=%s" % (
+        decision["baseline"], decision["treatment"], result["top_k"],
+        result["num_queries"], as_of))
+    print("  gold: %s" % result.get("gold_path"))
+    verdict = "PASS" if decision["passed"] else "FAIL"
+    tail = "bm25+acr MAY become the default" if decision["passed"] \
+        else "default stays bm25"
+    print("  DECISION: %s  (%s)" % (verdict, tail))
+    p = c["primary"]
+    print("  [%s] primary    : nDCG delta %+.4f  (>= margin %.4f)" % (
+        _ok(p["passed"]), p["delta_ndcg"], p["margin"]))
+    s = c["significance"]
+    print("  [%s] significant: t=%.4f  df=%d  t_crit=%.4f  mean_delta=%+.4f  "
+          "(alpha=%.2f)" % (_ok(s["passed"]), s["t"], s["df"], s["t_crit"],
+                            s["mean_delta"], s["alpha"]))
+    w = c["win_rate"]
+    print("  [%s] win-rate   : improved=%d  regressed=%d  ties=%d" % (
+        _ok(w["passed"]), w["improved"], w["regressed"], w["ties"]))
+    nh = c["no_harm"]
+    print("  [%s] no-harm    : recall=%s  mrr=%s  latency_p50=%s  determinism=%s"
+          % (_ok(nh["passed"]), _ok(nh["recall"]["passed"]),
+             _ok(nh["mrr"]["passed"]), _ok(nh["latency_p50"]["passed"]),
+             _ok(nh["determinism_ok"])))
+    a = c["age_stratum"]
+    print("  [%s] old-stratum: n=%d  base nDCG=%.4f  treat nDCG=%.4f  "
+          "(no-regression)" % (_ok(a["passed"]), a["old_count"],
+                               a["old_ndcg_baseline"], a["old_ndcg_treatment"]))
+
+
+def _run_acr_gate(args, kdir, data, gold, gold_path, as_of):
+    """Run the bm25-vs-bm25+acr ablation at a PINNED `as_of` and apply the
+    deterministic 5-part ACR win gate. Exits non-zero on FAIL.
+
+    Phase 4.1: with `--record`, appends ONE immutable `mode="acr-gate"` row
+    (decision + both strategies + deltas + t-stat + per-stratum) to the ledger
+    and regenerates SCORECARD.md. The recorded `strategy` field IS the resulting
+    agent-facing default — `active_default_strategy` reads it so bare `recall`
+    auto-flips iff the gate PASSED (else stays `bm25`). Recording is read-only
+    w.r.t. the KB (INV-2). Without `--record` the gate stays a pure read."""
+    result = evaluate_ablation(kdir, data, gold, args.top_k,
+                               baseline="bm25", treatment="bm25+acr",
+                               as_of=as_of)
+    result["as_of"] = as_of
+    result["gold_path"] = gold_path
+    determinism_ok = _determinism_check_at(
+        kdir, data, gold, args.top_k, "bm25+acr", as_of)
+    decision = acr_gate_decision(
+        result,
+        margin=getattr(args, "acr_margin", ACR_GATE_MARGIN),
+        alpha=getattr(args, "acr_alpha", ACR_GATE_ALPHA),
+        determinism_ok=determinism_ok)
+    result["acr_gate"] = decision
+    decided = "bm25+acr" if decision["passed"] else "bm25"
+    if getattr(args, "record", False):
+        recorded = record_acr_gate(
+            kdir, data, gold, gold_path, result, decision, args.top_k, as_of)
+        scorecard_path, _ = write_scorecard(kdir)
+        result["recorded"] = {
+            "path": os.path.join(kdir, HISTORY_REL),
+            "commit": recorded["commit"], "run": recorded["run"],
+            "reliability": recorded["reliability"],
+            "default_strategy": decided,
+            "scorecard": scorecard_path,
+        }
+    if args.format == "json":
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return 0 if decision["passed"] else 1
+    _print_acr_gate(result, decision, as_of)
+    if "recorded" in result:
+        print("  recorded : %s (run %s, reliability %.2f)" % (
+            result["recorded"]["path"], result["recorded"]["run"],
+            result["recorded"]["reliability"]))
+        print("  default  : bare `recall` now resolves to '%s'" % decided)
+    return 0 if decision["passed"] else 1
+
+
 def cmd_eval(args):
     kdir = require_knowledge_dir()
     if not kdir:
@@ -2672,10 +3220,31 @@ def cmd_eval(args):
     if args.top_k <= 0:
         sys.stderr.write("agentware: --top-k must be a positive integer\n")
         return 1
+    as_of = getattr(args, "as_of", None) or _today()
+    if not _is_valid_date(as_of):
+        sys.stderr.write("agentware: --as-of must be a YYYY-MM-DD date\n")
+        return 1
+
+    if getattr(args, "acr_gate", False):
+        try:
+            return _run_acr_gate(args, kdir, data, gold, gold_path, as_of)
+        except NotImplementedError as exc:
+            sys.stderr.write("agentware: %s\n" % exc)
+            return 2
 
     if getattr(args, "ablate", False):
+        baseline = getattr(args, "baseline", "tag")
+        treatment = getattr(args, "treatment", "bm25")
+        if baseline == treatment:
+            sys.stderr.write(
+                "agentware: --baseline and --treatment must differ (got %s)\n"
+                % baseline)
+            return 1
         try:
-            result = evaluate_ablation(kdir, data, gold, args.top_k)
+            result = evaluate_ablation(kdir, data, gold, args.top_k,
+                                       baseline=baseline, treatment=treatment,
+                                       as_of=as_of)
+            result["as_of"] = as_of
         except NotImplementedError as exc:
             sys.stderr.write("agentware: %s\n" % exc)
             return 2
@@ -2713,11 +3282,12 @@ def cmd_eval(args):
         return _gate_exit(gate)
 
     try:
-        result = evaluate(kdir, data, gold, args.strategy, args.top_k)
+        result = evaluate(kdir, data, gold, args.strategy, args.top_k, as_of=as_of)
     except NotImplementedError as exc:
         sys.stderr.write("agentware: %s\n" % exc)
         return 2
     result["gold_path"] = gold_path
+    result["as_of"] = as_of
     recorded, gate = _record_and_gate(args, kdir, data, gold, gold_path, result)
 
     if args.format == "json":
@@ -2767,9 +3337,18 @@ def cmd_recall(args):
     if args.token_budget < 0:
         sys.stderr.write("agentware: --token-budget must be >= 0\n")
         return 1
+    as_of = getattr(args, "as_of", None) or _today()
+    if not _is_valid_date(as_of):
+        sys.stderr.write("agentware: --as-of must be a YYYY-MM-DD date\n")
+        return 1
 
+    # Resolve the ranking strategy. An explicit --strategy/--acr always wins;
+    # otherwise the agent-facing default is the gated default from the ledger
+    # (bm25+acr iff the recorded ACR gate PASSED, else bm25) — the Phase 4.1
+    # auto-flip. Bare `recall` inherits the gate decision with no agent edits.
+    strategy = getattr(args, "strategy", None) or active_default_strategy(kdir)
     ranked = recall_ranked(kdir, data, args.query, top_k=args.top_k,
-                           category=args.category)
+                           category=args.category, strategy=strategy, as_of=as_of)
     results = []
     used = 0
     for entry, score, doc_text in ranked:
@@ -2789,7 +3368,8 @@ def cmd_recall(args):
     if args.format == "json":
         payload = {
             "query": args.query,
-            "strategy": "bm25",
+            "strategy": strategy,
+            "as_of": as_of,
             "top_k": args.top_k,
             "token_budget": args.token_budget,
             "category": args.category,
@@ -2801,8 +3381,8 @@ def cmd_recall(args):
         sys.stdout.write("\n")
         return 0
 
-    print("recall: query=%r  strategy=bm25  top_k=%d  budget=%d  -> %d entr%s (~%d tokens)"
-          % (args.query, args.top_k, args.token_budget, len(results),
+    print("recall: query=%r  strategy=%s  top_k=%d  budget=%d  -> %d entr%s (~%d tokens)"
+          % (args.query, strategy, args.top_k, args.token_budget, len(results),
              "y" if len(results) == 1 else "ies", used))
     if args.category:
         print("  category: %s" % args.category)
@@ -4430,6 +5010,19 @@ def build_parser():
                           help="trim so cumulative est. tokens <= budget (default: 1500)")
     p_recall.add_argument("--category", default=None,
                           help="restrict ranking to a single category")
+    p_recall.add_argument("--strategy", choices=("bm25", "bm25+acr"),
+                          default=None,
+                          help="ranking strategy (default: the gated default — "
+                               "bm25+acr iff the recorded ACR win gate passed, "
+                               "else bm25; bm25+acr applies the ACR "
+                               "provenance+freshness prior over BM25)")
+    p_recall.add_argument("--acr", action="store_const", const="bm25+acr",
+                          dest="strategy",
+                          help="shorthand for --strategy bm25+acr (opt into the "
+                               "ACR re-rank; reorders within the BM25 set only)")
+    p_recall.add_argument("--as-of", default=None, dest="as_of",
+                          help="YYYY-MM-DD date for ACR freshness decay "
+                               "(default: today; PIN it for reproducible runs)")
     p_recall.set_defaults(func=cmd_recall)
 
     # eval -------------------------------------------------------------------
@@ -4441,11 +5034,21 @@ def build_parser():
         help="path to gold set JSON (default: <kdir>/benchmarks/recall-gold.json)")
     p_eval.add_argument("--top-k", type=int, default=5, dest="top_k",
                         help="cutoff k for @k metrics (default: 5)")
-    p_eval.add_argument("--strategy", choices=("tag", "bm25"), default="tag",
-                        help="retrieval strategy to score (default: tag baseline)")
+    p_eval.add_argument("--strategy", choices=("tag", "bm25", "bm25+acr"),
+                        default="tag",
+                        help="retrieval strategy to score (default: tag baseline; "
+                             "bm25+acr applies the ACR prior over BM25)")
     p_eval.add_argument("--ablate", action="store_true",
-                        help="run the gold set through both tag (baseline) and "
-                             "bm25 (treatment) and report the per-metric lift")
+                        help="run the gold set through both --baseline and "
+                             "--treatment strategies and report the per-metric lift")
+    p_eval.add_argument("--baseline", choices=("tag", "bm25", "bm25+acr"),
+                        default="tag",
+                        help="baseline strategy for --ablate (default: tag). "
+                             "Use bm25 to ablate the ACR prior (bm25 vs bm25+acr)")
+    p_eval.add_argument("--treatment", choices=("tag", "bm25", "bm25+acr"),
+                        default="bm25",
+                        help="treatment strategy for --ablate (default: bm25). "
+                             "Use bm25+acr to measure the ACR lift over plain BM25")
     p_eval.add_argument("--record", action="store_true",
                         help="append one immutable commit+UTC-date-stamped row "
                              "(with a 0-100 reliability score) to "
@@ -4458,6 +5061,24 @@ def build_parser():
     p_eval.add_argument("--tolerance", type=float, default=0.02,
                         help="max allowed drop per headline metric before --gate "
                              "fails (default: 0.02; reliability uses x100 points)")
+    p_eval.add_argument("--as-of", default=None, dest="as_of",
+                        help="YYYY-MM-DD date for ACR freshness decay "
+                             "(default: today; PINNED for reproducible benchmarks)")
+    p_eval.add_argument("--acr-gate", action="store_true", dest="acr_gate",
+                        help="run the bm25-vs-bm25+acr ablation at --as-of and "
+                             "apply the deterministic 5-part ACR win gate (nDCG "
+                             "margin + paired t-test + win-rate + no-harm "
+                             "guardrails + age-stratified no-regression); EXIT "
+                             "NON-ZERO on FAIL. Distinct from --gate.")
+    p_eval.add_argument("--acr-margin", type=float, default=ACR_GATE_MARGIN,
+                        dest="acr_margin",
+                        help="min mean nDCG@k lift for the ACR-gate primary "
+                             "check (default: %g)" % ACR_GATE_MARGIN)
+    p_eval.add_argument("--acr-alpha", type=float, default=ACR_GATE_ALPHA,
+                        dest="acr_alpha",
+                        help="paired t-test two-tailed significance level for "
+                             "the ACR gate (default: %g; table supports 0.05, "
+                             "0.01)" % ACR_GATE_ALPHA)
     p_eval.set_defaults(func=cmd_eval)
 
     # bench ------------------------------------------------------------------

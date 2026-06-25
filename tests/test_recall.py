@@ -193,6 +193,133 @@ class RecallCommandTest(SyntheticKBTestCase):
         self.assertIn("recall:", out)
 
 
+class Bm25AcrStrategyTest(SyntheticKBTestCase):
+    """`bm25+acr` (Phase 2.1): ACR re-ranks WITHIN the BM25 set, never adds to it.
+
+    Two entries share identical body vocabulary -> identical BM25 score, so plain
+    `bm25` orders them purely by the tie-break (created desc -> id asc). They
+    differ in `source`/`last_verified`, so `acr(entry, as_of)` differs and
+    `bm25+acr` reorders them by the ACR-weighted score.
+    """
+
+    AS_OF = "2026-06-25"
+
+    def setUp(self):
+        body = (
+            "# ACR\n\ndelta epsilon zeta delta epsilon zeta identical vocabulary "
+            "so both entries earn the SAME bm25 score and only acr can reorder.\n"
+        )
+        # Same score. Plain bm25 tie-break (created desc) puts the NEWER-created
+        # 'bbb-imported' first. acr flips it: 'aaa-user' (source=user,
+        # last_verified=as_of -> acr=1.0) beats 'bbb-imported' (source=imported,
+        # stale last_verified -> acr=0.8*0.85=0.68).
+        entries = [
+            {
+                "id": "aaa-user",
+                "title": "ACR A",
+                "category": "references",
+                "path": "references/acr-a.md",
+                "tags": ["acr"],
+                "created": "2026-01-01",          # OLDER created -> loses plain tie
+                "source": "user",                 # top provenance
+                "last_verified": "2026-06-25",    # fresh at as_of -> freshness 1.0
+                "summary": "delta epsilon zeta identical",
+                "body": body,
+            },
+            {
+                "id": "bbb-imported",
+                "title": "ACR B",
+                "category": "references",
+                "path": "references/acr-b.md",
+                "tags": ["acr"],
+                "created": "2026-06-01",          # NEWER created -> wins plain tie
+                "source": "imported",             # lowest provenance
+                "last_verified": "2026-01-01",    # stale -> freshness floored 0.85
+                "summary": "delta epsilon zeta identical",
+                "body": body,
+            },
+        ]
+        import tempfile, shutil
+        self.kdir = tempfile.mkdtemp(prefix="agentware-test-acr-")
+        self.addCleanup(shutil.rmtree, self.kdir, True)
+        self.index_data = build_synthetic_kb(self.kdir, entries=entries)
+
+    def test_plain_bm25_orders_by_created_tiebreak(self):
+        # Sanity: with equal scores plain bm25 puts the newer-created entry first.
+        ranked = CLI.retrieve_bm25(self.kdir, self.index_data, "delta epsilon zeta")
+        self.assertEqual(ranked, ["bbb-imported", "aaa-user"])
+
+    def test_acr_reorders_within_the_bm25_set(self):
+        ranked = CLI.retrieve_bm25_acr(
+            self.kdir, self.index_data, "delta epsilon zeta", self.AS_OF)
+        # acr flips the order: the user-authored, fresh entry wins.
+        self.assertEqual(ranked, ["aaa-user", "bbb-imported"])
+
+    def test_acr_surfaces_the_same_set_as_bm25(self):
+        plain = set(CLI.retrieve_bm25(
+            self.kdir, self.index_data, "delta epsilon zeta"))
+        acr = set(CLI.retrieve_bm25_acr(
+            self.kdir, self.index_data, "delta epsilon zeta", self.AS_OF))
+        self.assertEqual(plain, acr)  # same gate set; only the ORDER changes
+
+    def test_acr_never_adds_a_zero_relevance_entry(self):
+        # A term in no entry stays empty under acr (multiplier can't lift 0).
+        ranked = CLI.retrieve_bm25_acr(
+            self.kdir, self.index_data, "kangaroo", self.AS_OF)
+        self.assertEqual(ranked, [])
+
+    def test_acr_is_deterministic_at_fixed_as_of(self):
+        a = CLI.retrieve_bm25_acr(
+            self.kdir, self.index_data, "delta epsilon zeta", self.AS_OF)
+        b = CLI.retrieve_bm25_acr(
+            self.kdir, self.index_data, "delta epsilon zeta", self.AS_OF)
+        self.assertEqual(a, b)
+
+    def test_dispatch_via_retrieve_uses_bm25_acr(self):
+        ranked = CLI.retrieve(self.kdir, self.index_data,
+                              "delta epsilon zeta", "bm25+acr", as_of=self.AS_OF)
+        self.assertEqual(ranked, ["aaa-user", "bbb-imported"])
+
+    def test_recall_ranked_default_strategy_matches_plain_bm25(self):
+        # Bare recall_ranked (default strategy) must equal retrieve_bm25 order.
+        ranked_default = [e.get("id") for (e, _s, _t) in CLI.recall_ranked(
+            self.kdir, self.index_data, "delta epsilon zeta")]
+        plain = CLI.retrieve_bm25(self.kdir, self.index_data, "delta epsilon zeta")
+        self.assertEqual(ranked_default, plain)
+
+    def test_cli_strategy_flag_reorders_and_reports_strategy(self):
+        import json
+        payload = json.loads(self.run_cli(
+            ["recall", "delta epsilon zeta", "--strategy", "bm25+acr",
+             "--as-of", self.AS_OF, "--token-budget", "100000",
+             "--format", "json"])[1])
+        self.assertEqual(payload["strategy"], "bm25+acr")
+        self.assertEqual([r["id"] for r in payload["results"]],
+                         ["aaa-user", "bbb-imported"])
+
+    def test_cli_acr_shorthand_equals_strategy_flag(self):
+        long = self.run_cli(
+            ["recall", "delta epsilon zeta", "--strategy", "bm25+acr",
+             "--as-of", self.AS_OF, "--format", "json"])[1]
+        short = self.run_cli(
+            ["recall", "delta epsilon zeta", "--acr",
+             "--as-of", self.AS_OF, "--format", "json"])[1]
+        self.assertEqual(long, short)
+
+    def test_cli_bm25_acr_byte_identical_across_runs(self):
+        argv = ["recall", "delta epsilon zeta", "--strategy", "bm25+acr",
+                "--as-of", self.AS_OF, "--format", "json"]
+        self.assertEqual(self.run_cli(argv)[1], self.run_cli(argv)[1])
+
+    def test_bare_recall_default_is_plain_bm25(self):
+        import json
+        payload = json.loads(self.run_cli(
+            ["recall", "delta epsilon zeta", "--format", "json"])[1])
+        self.assertEqual(payload["strategy"], "bm25")
+        self.assertEqual([r["id"] for r in payload["results"]],
+                         ["bbb-imported", "aaa-user"])
+
+
 if __name__ == "__main__":
     import unittest
     unittest.main()

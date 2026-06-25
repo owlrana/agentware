@@ -280,7 +280,8 @@ any of it.
 
 ```bash
 scripts/agentware recall "<free-text query>" \
-  [--top-k 5] [--token-budget 1500] [--category learnings] [--format text|json]
+  [--top-k 5] [--token-budget 1500] [--category learnings] [--format text|json] \
+  [--strategy bm25|bm25+acr] [--acr] [--as-of YYYY-MM-DD]
 ```
 
 `recall` ranks every entry (built from its title + summary + tags + file body)
@@ -291,14 +292,23 @@ deterministic: score desc → `created` desc → `id` asc. This is what the exec
 agent runs at task start (`R-CTX-05`) to inject a **small, focused** set instead of
 dumping all of `MAIN.md` — it reduces context cost, it never increases it. Use
 `--format json` for a stable machine-readable schema (`id`, `path`, `score`,
-`summary`, `estimated_tokens`).
+`summary`, `estimated_tokens`, `strategy`, `as_of`).
+
+`--strategy` chooses the ranker: `bm25` is the plain keyword baseline; `bm25+acr`
+layers the **ACR provenance + freshness prior** over it (see *ACR re-ranking* below).
+`--acr` is shorthand for `--strategy bm25+acr`. When you pass neither, bare `recall`
+inherits the **gated default**: `bm25+acr` iff the most recent recorded ACR win gate
+passed, else plain `bm25` — so agents get the better ranker for free the moment it
+earns it, with zero steering edits. `--as-of YYYY-MM-DD` pins the date ACR uses for
+freshness decay (default: today); pin it for byte-identical reproducible runs.
 
 ### `eval` — measure recall quality against a gold set
 
 ```bash
-scripts/agentware eval [--strategy tag|bm25] [--top-k 5] \
-  [--gold <path>] [--ablate] [--record] [--gate] [--tolerance 0.02] \
-  [--format text|json]
+scripts/agentware eval [--strategy tag|bm25|bm25+acr] [--top-k 5] \
+  [--gold <path>] [--ablate] [--baseline tag|bm25|bm25+acr] [--treatment tag|bm25|bm25+acr] \
+  [--record] [--gate] [--tolerance 0.02] [--as-of YYYY-MM-DD] \
+  [--acr-gate] [--acr-margin 0.01] [--acr-alpha 0.05] [--format text|json]
 ```
 
 `eval` scores a retrieval strategy against an operator-owned gold set
@@ -306,16 +316,73 @@ scripts/agentware eval [--strategy tag|bm25] [--top-k 5] \
 `{ "query": …, "expected_ids": [ … ] }`) and reports **Recall@k**, **precision@k**,
 **nDCG@k**, **MRR**, mean/p50 **latency**, and the **context-token footprint** the
 returned set injects. `--strategy tag` scores the legacy exact-tag path (the
-untouched-agentware baseline); `--strategy bm25` scores `recall`.
+untouched-agentware baseline); `--strategy bm25` scores `recall`; `--strategy
+bm25+acr` scores the ACR-re-ranked path.
 
-- `--ablate` runs the same gold set through **both** strategies and prints the
-  per-metric lift — the concrete proof BM25 recall beats tag-only retrieval.
+- `--ablate` runs the same gold set through **both** `--baseline` and `--treatment`
+  strategies and prints the per-metric lift. Defaults are `tag` vs `bm25` (the proof
+  BM25 beats tag-only); pass `--baseline bm25 --treatment bm25+acr` to measure the
+  ACR lift over plain BM25.
+- `--as-of YYYY-MM-DD` pins the date ACR uses for freshness decay (default: today).
+  **Pin it for reproducible benchmarks** — the same gold set + same `as_of` yields
+  byte-identical numbers.
 - `--record` appends one **immutable, commit-SHA + UTC-date-stamped** row (with a
   0–100 composite reliability score) to `<knowledge-dir>/benchmarks/history.jsonl`.
   The ledger is strictly **append-only**: rows are never edited or deleted.
 - `--gate [--tolerance T]` compares this run to the best prior comparable row and
   **exits non-zero** if any headline metric (or the reliability score) regresses
   beyond tolerance; it implies `--record`, and seeds + passes on the first run.
+- `--acr-gate` runs the bm25-vs-bm25+acr ablation at `--as-of` and applies the
+  deterministic **5-part ACR win gate** (see below); it **exits non-zero on FAIL**
+  and is distinct from `--gate`. `--acr-margin` (default `0.01`) tunes the primary
+  nDCG-lift threshold and `--acr-alpha` (default `0.05`; table supports `0.05`,
+  `0.01`) the paired-t significance level. Add `--record` to log the decision +
+  evidence and auto-flip the `recall` default on a PASS.
+
+### ACR re-ranking — provenance + freshness prior (benchmark-gated default)
+
+`bm25+acr` layers a gentle, deterministic **ACR** (Authority · Confidence ·
+Recency) prior over the BM25 score so trusted, fresher entries get a nudge —
+**without** overriding relevance and **without** breaking reproducibility.
+
+- **Formula.** `acr(entry, as_of) = source_weight(entry.source) × freshness(entry.last_verified, as_of)`.
+  `source_weight` is a provenance prior (`user=1.0`, `agent=0.9`, `imported=0.8`;
+  unknown/missing → `0.9`). `freshness = max(FLOOR, 0.5 ** (age_days / H))` with
+  half-life `H=90` days and `FLOOR=0.85`, where `age_days = as_of − last_verified`
+  (clamped ≥ 0; `last_verified` falls back to `created`). All constants are tunable.
+- **Blend.** `final = bm25_relevance × acr`. The blend is **relevance-dominant** and
+  multiplicative: a near-zero BM25 entry stays near-zero, so ACR only **reorders
+  within the set BM25 already surfaced** — it never injects a zero-relevance entry.
+- **The `as_of` determinism contract.** Decay needs a "now", but a wall-clock would
+  break byte-identical output. So `as_of` is an **explicit parameter** of `recall`
+  and `eval` (default = today; **pin it** in tests/benchmarks). ACR is then a pure
+  stdlib function of `(last_verified, as_of)` — no hidden clock, no LLM, no network.
+  At a fixed `as_of`, `recall --strategy bm25+acr` is **byte-identical across runs**.
+  Date-awareness (ranking shifts as entries age) is an intended feature, not a
+  regression — the input is explicit, so reproducibility is preserved.
+- **The win gate (`eval --acr-gate`) decides the default.** ACR becomes the default
+  **only if** it wins a rigorous gate; **all five** parts must hold:
+  1. **Primary** — mean `nDCG@k(bm25+acr) − nDCG@k(bm25) ≥ MARGIN` (default `+0.01`).
+  2. **Significant** — a stdlib **paired t-test** on per-query nDCG deltas
+     (`df = n−1`, `|t| ≥ t_crit(α)` from a critical-value table; no scipy, no bootstrap).
+  3. **Win-rate** — queries improved > queries regressed (descriptive sign check).
+  4. **No-harm guardrails** — `Recall@k` and `MRR` not worse (within ε), p50 latency
+     within budget, and determinism holds (byte-identical at fixed `as_of`).
+  5. **Age-stratified no-regression** — split the gold set by whether the correct
+     answer is a RECENT vs OLD entry; ACR must **not** regress nDCG on the
+     **OLD-answer** stratum (so it can't "win" merely by boosting recent entries).
+- **Ledger-driven auto-flip.** `eval --acr-gate --record` writes one immutable
+  `mode="acr-gate"` row (full decision + both strategies' numbers, t-stat,
+  per-stratum) to `history.jsonl` and regenerates `SCORECARD.md`. Bare `recall` then
+  derives its default by reading the **most recent** acr-gate row: PASS → `bm25+acr`,
+  FAIL → `bm25`. There is no config flag to drift — one append-only source of truth.
+  Plain `--strategy bm25` always stays reachable for baselining / eval reproducibility.
+
+> On a provenance/freshness-**homogeneous** KB (e.g. mostly recent, agent-authored
+> entries) ACR is a near-constant multiplier, so the gate honestly **FAILs** and the
+> default stays `bm25` — the flip earns its way in only when ACR delivers measurable
+> lift. The reorder + flip behaviour is proven on diverse synthetic fixtures in
+> `tests/test_recall.py` and `tests/test_acr_gate.py`.
 
 ### `bench scorecard` — human-readable trend
 
