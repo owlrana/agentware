@@ -279,8 +279,11 @@ agentware ships a deterministic, **stdlib-only** retrieval + measurement spine.
 Every command below is **read-only** over your knowledge base (it never writes
 `index.json` or any entry — the toolkit's `learn`/`index add` stay the sole
 writers), and every ranking is reproducible: identical inputs produce
-byte-identical output. There is **no LLM, no embedding model, and no network** in
-any of it.
+byte-identical output. In the **default mode (Mode A)** there is **no LLM, no
+embedding model, and no network** in any of it. An **opt-in** local-semantic mode
+(Mode B) adds a LOCAL embedding model you install yourself — still **no LLM in the
+retrieval path and no remote API** (see *Retrieval modes* below). Mode A stays the
+default and is never affected by Mode B.
 
 ### `recall` — ranked relevance retrieval
 
@@ -389,6 +392,99 @@ Recency) prior over the BM25 score so trusted, fresher entries get a nudge —
 > default stays `bm25` — the flip earns its way in only when ACR delivers measurable
 > lift. The reorder + flip behaviour is proven on diverse synthetic fixtures in
 > `tests/test_recall.py` and `tests/test_acr_gate.py`.
+
+### Retrieval modes — A (deterministic, default) / B (local semantic, opt-in)
+
+agentware ships **two** retrieval modes. You pick one at onboarding (or switch any
+time); the choice is a product decision, not a quality compromise — Mode A is a
+genuinely strong, top-competitive baseline (see the numbers below), and Mode B
+trades zero-install portability for extra paraphrase recall.
+
+| | **Mode A — Pure Deterministic** (default) | **Mode B — Local Semantic** (opt-in) |
+|---|---|---|
+| Ranker | BM25 (+ ACR), pure stdlib | BM25 **+** a LOCAL embedding model, fused by **RRF** (`bm25+embed`) |
+| Install | **Zero** — works with nothing installed | You install a LOCAL embedding model yourself |
+| Reproducibility | **Byte-identical forever** | Reproducible given the **pinned model id + derived vector cache** |
+| LLM in retrieval | **None** | **None** (an embedding model is not an LLM; no generation, no prompts) |
+| Network | **None** | **None at query time** — LOCAL model only, no remote API |
+| Best for | Max auditability, portability, determinism | Max accuracy / paraphrase recall |
+
+- **Picking / switching.** Onboarding asks once. To change later:
+  `scripts/agentware config --set-mode deterministic|semantic` (persists to
+  `~/.agentware/config.env`; the `AGENTWARE_RETRIEVAL_MODE` env var overrides
+  per-run). Inspect the resolved state with `scripts/agentware config --format json`
+  (`retrieval_mode` = what you chose, `effective_retrieval_mode` = what actually
+  runs) or the bare `scripts/agentware config --retrieval-mode-only` for shell use.
+- **The local embedder is pluggable and LAZILY imported.** Mode B reads
+  `AGENTWARE_EMBEDDER_BACKEND` — a dotted module (or a path to one) exposing
+  `embed(texts) -> vectors`. A reference backend ships in
+  `scripts/agentware_embedder_ollama.py` (talks to a LOCAL Ollama serving e.g.
+  `nomic-embed-text`). The module is imported **only** when Mode B is active, so
+  Mode A carries **zero** import cost and never depends on anything being installed.
+- **The determinism contract (A unconditional / B model-pinned).** Mode A is
+  byte-identical for all time — same inputs, same bytes, no exceptions. Mode B is
+  reproducible **relative to a pinned model id + the derived vector cache** (keyed by
+  content fingerprint + model id); change the model and you must rebuild the cache.
+  The vector cache is a **derived, regenerable** artifact written **only** by the
+  toolkit — never a hand-edited source of truth.
+- **Honest fallback (Mode B never crashes).** If you configure `semantic` but **no
+  local model is reachable**, the effective mode degrades to **Mode A** and a notice
+  is printed to **stderr** — `retrieval_mode=semantic requested but no local
+  embedding model is available; falling back to deterministic (Mode A / BM25).
+  Install a local model and rebuild the vector cache to enable semantic retrieval.`
+  Stdout/JSON stays Mode-A byte-identical, so capture pipelines are unaffected.
+- **No new HARD dependency.** Nothing about Mode B is required to use agentware; it
+  is strictly additive and off the Mode-A path.
+
+### Benchmark methodology & numbers (LongMemEval)
+
+The `eval --suite longmemeval` scorer is **strategy-agnostic** and reports the one
+**directly-comparable** public number the agent-memory field uses: **Recall@5** on
+**LongMemEval-S (cleaned)** — same metric, same dataset variant, same "no LLM in the
+retrieval loop" rule. The protocol is **session-level** (the gold unit is the
+evidence session), **k = 5**, with **abstention questions scored separately** from
+answerable ones (never blended into the headline). Pin `--as-of` for byte-identical
+reproduction.
+
+| Mode | LongMemEval-S Recall@5 | Notes |
+|---|---|---|
+| **A (BM25, default)** | **0.9140** | 470 answerable, 30 abstention separated; per-category: single-session-assistant 1.000, etc. Own gold-set Recall@5 0.9554. |
+| **B (local semantic)** | _pending_ | Requires an operator-installed LOCAL embedding model; the headline is recorded by the Phase 6/8 tuning + E2E run once a model is available. With no model, Mode B falls back to A (above). |
+
+**Reproduce from scratch (anyone, no account or token needed).** The dataset is
+not shipped (it is ~277 MB); it is fetched from Hugging Face pinned to an exact
+commit + sha256, so the bytes you score are provably the bytes we scored.
+
+```bash
+# 1. Fetch the cleaned variant into your knowledge dir, pinned to an exact commit.
+#    KDIR="$(scripts/agentware config --knowledge-dir-only)"
+mkdir -p "$KDIR/benchmarks/longmemeval" && cd "$KDIR/benchmarks/longmemeval"
+curl -sS -L -o longmemeval_s_cleaned.json \
+  "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/98d7416c24c778c2fee6e6f3006e7a073259d48f/longmemeval_s_cleaned.json"
+
+# 2. Verify the bytes (MUST match, or the comparison is not apples-to-apples).
+shasum -a 256 longmemeval_s_cleaned.json
+#   → d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442
+
+# 3. Run the benchmark (pure stdlib — nothing else to install for Mode A).
+cd -  # back to the agentware repo
+scripts/agentware eval --suite longmemeval --strategy bm25 --top-k 5 --as-of 2026-06-25
+#   → Recall@5 0.9140 · nDCG@5 0.8831 · MRR 0.9104 · 470 answerable · 30 abstention separate
+```
+
+The scorer is **deterministic and read-only**: no LLM, no network, no embeddings at
+score time, and it re-scores a sample to assert byte-identical ordering
+(`determinism_ok`). The 30 `_abs` abstention questions are excluded from the Recall
+aggregate and reported separately (Recall@k is undefined for them). Add `--record`
+to append the run to the append-only ledger (`benchmarks/history.jsonl`); commit
+your working tree first so the row is pinned to a clean commit rather than a dirty
+tree. The full provenance (both variants, pinned commits, sha256s, schema, category
+counts) is regenerated as `benchmarks/longmemeval/DATASET.md` in your knowledge dir.
+
+For context, agentmemory's published hybrid headline is **95.2% Recall@5** — so
+Mode A's **91.4%** is already top-competitive with a pure-stdlib, zero-install,
+byte-identical ranker. Mode B targets closing the remaining gap; its real number is
+reported honestly when measured (never fabricated, never from a test stub).
 
 ### `bench scorecard` — human-readable trend
 

@@ -291,6 +291,158 @@ class TestKbAutocommitConfig(unittest.TestCase):
         self.assertEqual(payload["kb_autocommit"], "0")
 
 
+class TestRetrievalModeConfig(unittest.TestCase):
+    """Resolution + persistence of AGENTWARE_RETRIEVAL_MODE (feature
+    260625-semantic-retrieval-benchmark, Phase 3.1).
+
+    Precedence: env -> config.env -> default 'deterministic' (Mode A). 'semantic'
+    (Mode B) is opt-in and, until a local model is wired (Phase 3.2), the
+    EFFECTIVE mode gracefully falls back to 'deterministic'. The suite patches
+    HOME_CONFIG / CONFIG_PATHS onto a temp file and manages the env var, so it
+    NEVER touches the operator's real ~/.agentware/config.env.
+    """
+
+    def setUp(self):
+        import io as _io
+        import contextlib as _ctx
+        self._io, self._ctx = _io, _ctx
+        self.cli = load_cli()
+        self.home = tempfile.mkdtemp(prefix="agentware-mode-home-")
+        self.addCleanup(shutil.rmtree, self.home, True)
+        self.cfg = os.path.join(self.home, ".agentware", "config.env")
+
+        self._orig_home_config = self.cli.HOME_CONFIG
+        self._orig_config_paths = self.cli.CONFIG_PATHS
+        self.cli.HOME_CONFIG = self.cfg
+        self.cli.CONFIG_PATHS = (self.cfg,)
+
+        def _restore_paths():
+            self.cli.HOME_CONFIG = self._orig_home_config
+            self.cli.CONFIG_PATHS = self._orig_config_paths
+        self.addCleanup(_restore_paths)
+
+        self._prev_env = os.environ.pop(self.cli.RETRIEVAL_MODE_KEY, None)
+
+        def _restore_env():
+            if self._prev_env is None:
+                os.environ.pop(self.cli.RETRIEVAL_MODE_KEY, None)
+            else:
+                os.environ[self.cli.RETRIEVAL_MODE_KEY] = self._prev_env
+        self.addCleanup(_restore_env)
+
+    def _run(self, argv):
+        out, err = self._io.StringIO(), self._io.StringIO()
+        with self._ctx.redirect_stdout(out), self._ctx.redirect_stderr(err):
+            code = self.cli.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def _set_env(self, val):
+        os.environ[self.cli.RETRIEVAL_MODE_KEY] = val
+
+    def _write_cfg(self, text):
+        os.makedirs(os.path.dirname(self.cfg), exist_ok=True)
+        with open(self.cfg, "w", encoding="utf-8") as f:
+            f.write(text)
+
+    def _read_cfg(self):
+        with open(self.cfg, "r", encoding="utf-8") as f:
+            return f.read()
+
+    # --- resolution precedence ------------------------------------------------
+    def test_default_deterministic_when_unset(self):
+        code, out, _ = self._run(["config", "--retrieval-mode-only"])
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "deterministic")
+
+    def test_configured_mode_resolves(self):
+        # Configured CONFIGURED value (deterministic, model not required).
+        self._write_cfg("AGENTWARE_RETRIEVAL_MODE=deterministic\n")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "deterministic")
+        self._write_cfg("AGENTWARE_RETRIEVAL_MODE=semantic\n")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "semantic")
+
+    def test_env_overrides_config(self):
+        self._write_cfg("AGENTWARE_RETRIEVAL_MODE=semantic\n")
+        self._set_env("deterministic")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "deterministic")
+
+    def test_env_empty_falls_through_to_config(self):
+        self._write_cfg("AGENTWARE_RETRIEVAL_MODE=semantic\n")
+        self._set_env("")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "semantic")
+
+    def test_unknown_value_falls_back_to_default(self):
+        # A typo never silently activates the opt-in semantic mode.
+        self._set_env("garbge")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "deterministic")
+
+    def test_friendly_aliases(self):
+        self._set_env("B")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "semantic")
+        self._set_env("A")
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "deterministic")
+
+    # --- effective-mode fallback (semantic + no local model) ------------------
+    def test_semantic_falls_back_to_deterministic_without_model(self):
+        # No embedder is wired in Phase 3.1, so semantic -> effective deterministic.
+        self.assertFalse(self.cli.semantic_embedder_available())
+        self._write_cfg("AGENTWARE_RETRIEVAL_MODE=semantic\n")
+        eff, fell_back, notice = self.cli.resolve_effective_retrieval_mode()
+        self.assertEqual(eff, "deterministic")
+        self.assertTrue(fell_back)
+        self.assertIn("local", notice.lower())
+
+    def test_retrieval_mode_only_prints_effective_with_notice_on_stderr(self):
+        self._write_cfg("AGENTWARE_RETRIEVAL_MODE=semantic\n")
+        code, out, err = self._run(["config", "--retrieval-mode-only"])
+        self.assertEqual(code, 0)
+        # stdout is a single clean token (the EFFECTIVE mode); notice -> stderr.
+        self.assertEqual(out.strip(), "deterministic")
+        self.assertIn("falling back", err.lower())
+
+    # --- persistence ----------------------------------------------------------
+    def test_set_mode_semantic_persists_and_resolves(self):
+        code, out, _ = self._run(["config", "--set-mode", "semantic"])
+        self.assertEqual(code, 0, out)
+        self.assertIn("AGENTWARE_RETRIEVAL_MODE=semantic", self._read_cfg())
+        self.assertEqual(self.cli.resolve_retrieval_mode(), "semantic")
+
+    def test_set_mode_roundtrip_deterministic(self):
+        self._run(["config", "--set-mode", "deterministic"])
+        self.assertIn("AGENTWARE_RETRIEVAL_MODE=deterministic", self._read_cfg())
+        _, out, _ = self._run(["config", "--retrieval-mode-only"])
+        self.assertEqual(out.strip(), "deterministic")
+
+    def test_set_mode_preserves_knowledge_dir(self):
+        self._write_cfg("AGENTWARE_KNOWLEDGE_DIR=/tmp/kb-xyz\n")
+        self._run(["config", "--set-mode", "semantic"])
+        body = self._read_cfg()
+        self.assertIn("AGENTWARE_KNOWLEDGE_DIR=/tmp/kb-xyz", body)
+        self.assertIn("AGENTWARE_RETRIEVAL_MODE=semantic", body)
+
+    def test_set_mode_upserts_no_duplicates(self):
+        self._run(["config", "--set-mode", "semantic"])
+        self._run(["config", "--set-mode", "deterministic"])
+        body = self._read_cfg()
+        self.assertEqual(body.count("AGENTWARE_RETRIEVAL_MODE="), 1, body)
+        self.assertIn("AGENTWARE_RETRIEVAL_MODE=deterministic", body)
+
+    def test_set_mode_invalid_value_errors(self):
+        code, _, err = self._run(["config", "--set-mode", "maybe"])
+        self.assertEqual(code, 2)
+        self.assertIn("invalid", err.lower())
+        self.assertFalse(os.path.isfile(self.cfg))
+
+    def test_config_json_surfaces_retrieval_mode(self):
+        self._write_cfg("AGENTWARE_KNOWLEDGE_DIR=%s\nAGENTWARE_RETRIEVAL_MODE=semantic\n"
+                        % self.home)
+        code, out, _ = self._run(["config", "--format", "json"])
+        payload = json.loads(out)
+        self.assertEqual(payload["retrieval_mode"], "semantic")
+        # Effective falls back to deterministic until a local model is wired.
+        self.assertEqual(payload["effective_retrieval_mode"], "deterministic")
+
+
 class TestKbGitignoreScaffold(unittest.TestCase):
     """`_ensure_kb_gitignore` — KB .gitignore that excludes logs/ transcripts.
 
@@ -334,16 +486,17 @@ class TestKbGitignoreScaffold(unittest.TestCase):
         self.assertIn("*.tmp", lines)  # original content preserved
 
     def test_recognizes_bare_rules_without_trailing_slash(self):
-        # Both required rules present in bare (no trailing slash) form → recognized
+        # All required rules present in bare (no trailing slash) form → recognized
         # as already-ignored (normalized by stripping the trailing slash), so the
         # helper is a no-op "kept" and does not duplicate them.
         with open(self._path(), "w", encoding="utf-8") as f:
-            f.write("logs\n.loop\n")
+            f.write("logs\n.loop\n.cache\n")
         action = self.cli._ensure_kb_gitignore(self.kdir)
         self.assertEqual(action, "kept")
         lines = [ln.strip() for ln in self._read().splitlines()]
         self.assertEqual(lines.count("logs"), 1)  # not duplicated as logs/
         self.assertEqual(lines.count(".loop"), 1)  # not duplicated as .loop/
+        self.assertEqual(lines.count(".cache"), 1)  # not duplicated as .cache/
 
     def test_appends_only_missing_loop_rule_to_bare_logs(self):
         # A KB scaffolded before `.loop/` existed (only bare `logs`) self-heals:

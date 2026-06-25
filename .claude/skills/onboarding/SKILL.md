@@ -282,6 +282,40 @@ Then ask once and persist the answer. The setting resolves env → config →
 5. Note the escape hatch: a per-run `AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh …`
    overrides the persisted setting for a single run.
 
+#### Step 7b-2 — Retrieval mode (Mode A / Mode B)
+
+agentware retrieves knowledge with one of two modes; ask once and persist the
+answer. The setting resolves env → config → **default `deterministic` (Mode A)**.
+
+- **Mode A — "Pure Deterministic" (DEFAULT, recommended):** BM25 (+ACR), pure
+  Python stdlib, **zero install**, byte-identical forever — maximum auditability
+  and portability. Works with nothing installed.
+- **Mode B — "Local Semantic" (opt-in, for max accuracy):** BM25 **+ a LOCAL
+  embedding model you install** (hybrid BM25+embed) to catch paraphrased matches
+  BM25 misses. Still deterministic (pinned model + cached vectors) and still
+  non-hallucinated (embeddings only RANK; they never author memory). Its only
+  costs: it needs a local model (breaks zero-install) and reproducibility is
+  pinned to that model version. **No cloud, no LLM in the retrieval path.**
+
+1. Ask: **"Retrieval mode — A (deterministic, zero-install, recommended) or B
+   (local semantic, higher accuracy, needs a local model)? [recommended: A]"**
+2. Persist the choice with the toolkit (the ONLY writer of the setting — accepts
+   `deterministic|semantic` and friendly aliases `A|B`):
+   ```bash
+   scripts/agentware config --set-mode deterministic   # or: semantic
+   ```
+   Confirm the EFFECTIVE mode it resolves to:
+   ```bash
+   scripts/agentware config --retrieval-mode-only   # prints deterministic|semantic
+   ```
+3. If they choose **B** but no local embedding model is wired yet, the effective
+   mode **gracefully falls back to `deterministic`** with a notice — it never
+   crashes and never silently misleads. Tell them Mode B activates once a local
+   model is installed (the model setup lands in a later step / docs). They can
+   switch anytime: `scripts/agentware config --set-mode deterministic|semantic`.
+4. Escape hatch: a per-run `AGENTWARE_RETRIEVAL_MODE=semantic ./agentware.sh …`
+   overrides the persisted setting for a single run.
+
 #### Step 7c — Install the two workflow aliases (and VERIFY them)
 
 These two aliases are the whole interface. Each launches the matching subagent
