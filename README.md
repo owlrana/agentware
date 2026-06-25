@@ -11,14 +11,13 @@
 ![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 ![data](https://img.shields.io/badge/data-100%25%20local%20·%20yours-0d9488)
 
-**Reliable agentic loops with deterministic, persistent memory — open-source, and 100% yours.**
-*Every loop builds on verified knowledge, self-heals, and gets smarter — zero LLM in the memory path, proven by benchmark. Open-source. Your data never leaves a directory you own.*
+*Every loop builds on verified knowledge, self-heals, and gets smarter — zero LLM in the memory path, proven by benchmark. Open-source. Your data never leaves a directory you own. Free of cost framework*
 
 </div>
 
 ---
 
-## Reliable Agentic Loops with persistent memory (open-source, 100% data ownership)
+## Reliable Agentic Loops with persistent memory
 
 There are two kinds of tools today, and a gap between them:
 
@@ -31,27 +30,27 @@ There are two kinds of tools today, and a gap between them:
 
 ---
 
-## How agentware stands vs autonomous agent harnesses
+## Feature comparison: agentware vs most used autonomous agentic harnesses
 
 The loop is table stakes; **trustworthy memory + self-betterment is not.** Every cell is sourced from each project's own docs, repos, and papers (verified 2026-06) — e.g. OpenClaw's memory-pollution finding is from its own [research paper](https://arxiv.org/abs/2603.23064).
 
-| Capability | **agentware** | OpenHands | OpenClaw | Cline | Aider | Goose |
-|---|:--:|:--:|:--:|:--:|:--:|:--:|
-| Autonomous execution loop | ✅ | ✅ | ✅ | ✅ | ⚠️ partial | ✅ |
-| Persistent cross-session memory (built-in) | ✅ | ⚠️ human-authored | ✅ | ❌ convention | ❌ per-session | ✅ |
-| **Memory managed by code, not an LLM** | ✅ | ❌ lossy summarizer | ❌ LLM-judge | ❌ | ✅ *(not persistent)* | ❌ |
-| **Non-hallucinated** (no LLM authors memory) | ✅ | ⚠️ | ❌ *pollution documented* | ❌ | ✅ | ❌ |
-| Self-heal + self-improve (learn→rule) | ✅ | ❌ | ⚠️ gated skills | ❌ | ⚠️ narrow | ⚠️ human-gated |
-| Self-extend (writes its own skills) | ✅ | ❌ | ✅ gated | ❌ | ❌ | ⚠️ |
-| Benchmark-gated regression ledger | ✅ | ❌ | ❌ | ⚠️ evals | ⚠️ leaderboard | ⚠️ |
-| Memory/retrieval needs **no LLM or network** | ✅ | ❌ | ❌ | ❌ | ✅ *(map only)* | ❌ |
-| Maturity / adoption (★, approx) | new | ≈78k | ≈380k | ≈64k | ≈47k | ≈50k |
+| Capability | **agentware** | OpenHands | OpenClaw | Cline | Aider | Goose | Hermes |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|:--:|
+| Autonomous execution loop | ✅ | ✅ | ✅ | ✅ | ⚠️ partial | ✅ | ✅ |
+| Persistent cross-session memory (built-in) | ✅ | ⚠️ human-authored | ✅ | ❌ convention | ❌ per-session | ✅ | ✅ |
+| **Memory managed by code, not an LLM** | ✅ | ❌ lossy summarizer | ❌ LLM-judge | ❌ | ✅ *(not persistent)* | ❌ | ❌ agent-curated |
+| **Non-hallucinated** (no LLM authors memory) | ✅ | ⚠️ | ❌ *pollution documented* | ❌ | ✅ | ❌ | ❌ LLM-curated |
+| Self-heal + self-improve (learn→rule) | ✅ | ❌ | ⚠️ gated skills | ❌ | ⚠️ narrow | ⚠️ human-gated | ✅ *(LLM Curator)* |
+| Self-extend (writes its own skills) | ✅ | ❌ | ✅ gated | ❌ | ❌ | ⚠️ | ✅ autonomous |
+| Benchmark-gated regression ledger | ✅ | ❌ | ❌ | ⚠️ evals | ⚠️ leaderboard | ⚠️ | ❌ |
+| Memory/retrieval needs **no LLM or network** | ✅ | ❌ | ❌ | ❌ | ✅ *(map only)* | ❌ | ❌ |
+| Maturity / adoption (★, approx) | new | ≈78k | ≈380k | ≈64k | ≈47k | ≈50k | ≈17k |
 
-✅ yes/strong · ⚠️ partial/caveated · ❌ no/weak. **The honest takeaway:** every harness has a loop, but **none pairs it with deterministic, persistent, non-LLM-managed memory + a regression gate.** Where they lead, we say so: OpenHands has sandboxed code-exec breadth, Cline has deep IDE integration, and all of them have vastly more adoption.
+✅ yes/strong · ⚠️ partial/caveated · ❌ no/weak. **The honest takeaway:** every harness has a loop, but **none pairs it with deterministic, persistent, non-LLM-managed memory + a regression gate.** Where they lead, we say so: OpenHands has sandboxed code-exec breadth, Cline has deep IDE integration, **Hermes is the closest in spirit** — local-first, persistent, and self-extending — and all of them have vastly more adoption. The line that still separates us from Hermes: its memory is **LLM-curated** (an autonomous Curator grades and prunes it), where ours is **code-managed and benchmark-gated**.
 
 ---
 
-## How agentware stands vs memory layers
+## Capability comparison: agentware vs industry-standard memory layers
 
 | Axis | **agentware** | mem0 | Letta | Zep / Graphiti | agentmemory | cognee |
 |---|:--:|:--:|:--:|:--:|:--:|:--:|
