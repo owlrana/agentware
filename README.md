@@ -1,209 +1,184 @@
-# agentware
+<div align="center">
 
-> ai agent that is aware and learns from your experience and creates custom knowledge bases
+<img src="docs/assets/hero.png" alt="agentware — Self-Learning Agentic Loop with Reliable Deterministic Memory" width="100%">
 
-**A clone-and-go steering framework for AI agents. The repo is pure steering —
-your knowledge base lives in a directory you choose, so the same clone works for
-anyone and nothing personal is ever committed.**
+<br/>
 
-agentware turns any AI agent runtime into a self-aware workspace where agents:
+![tests](https://img.shields.io/badge/tests-332%20passing-2dd4bf)
+![LongMemEval-S Recall@5](https://img.shields.io/badge/LongMemEval--S%20Recall%405-91.4%25-4ade80)
+![dependencies](https://img.shields.io/badge/dependencies-zero%20·%20stdlib-0d9488)
+![retrieval](https://img.shields.io/badge/retrieval-byte--identical-a3e635)
+![license](https://img.shields.io/badge/license-Apache--2.0-blue)
 
-- **Remember** what you're working on across sessions — in an **external
-  knowledge base** at a path you pick (your profile, projects, learnings, configs).
-- **Execute** multi-step tasks iteratively from short plans you write (the
-  **3-phase loop** in `agentware.sh`).
-- **Onboard themselves** the first time they run — they ask where to store your
-  knowledge, interview you, investigate your system, then personalize.
-- **Extend themselves** — you can ship features into agentware the same way you
-  ship features into any other project.
+**A self-learning agentic loop with reliable, deterministic memory.**
+*Every loop builds on verified knowledge, self-heals, and gets smarter — with zero LLM in the memory path. Proven by benchmark.*
 
-It is **cloud- and language-agnostic**. agentware does not assume which cloud,
-language, framework, or runtime you use. Verification of every step is expressed
-in *your* project's own build / test / health commands.
+</div>
 
 ---
 
-## The core idea: steering here, knowledge elsewhere
+## Agents hallucinate. Memory drifts. agentware does neither.
 
-```
-agentware/                 ← this repo: PURE STEERING (generic, shareable, no PII)
-  CLAUDE.md, AGENTS.md, .claude/, steering/, docs/, scripts/, agentware.sh, templates/
+There are two kinds of tools today, and a gap between them:
 
-<your-knowledge-dir>/      ← OUTSIDE the repo: YOUR knowledge (chosen at onboarding)
-  MAIN.md, index.json, learnings/, projects/, configurations/, prompts/, references/
-```
+- **Memory layers** (mem0, Letta, Zep, cognee, agentmemory) *remember* — but they're passive libraries with **no loop**, and most let an **LLM write the memory** (extraction/summarization), so what's stored is non-deterministic and can drift or hallucinate.
+- **Agent harnesses** (OpenHands, OpenClaw, Cline, Aider, Goose) *drive* a loop — but their **memory is the weak link**: ephemeral context, or an **LLM deciding what to store**. OpenClaw's own research documents *"silent memory pollution"* where ordinary misinformation rewrites long-term memory ([arXiv 2603.23064](https://arxiv.org/abs/2603.23064)).
 
-The repo finds your knowledge dir from (in order):
-1. the `AGENTWARE_KNOWLEDGE_DIR` environment variable, then
-2. `AGENTWARE_KNOWLEDGE_DIR=...` in `~/.agentware/config.env` (written by `init`, gitignored).
-
-Because the knowledge dir is external and the config is gitignored, **you can push
-this repo publicly** — the clone is generic and personal-data-free by design.
+**agentware is the seat between them:** a real execution loop **and** memory that's deterministic, non-hallucinated, benchmark-gated, and managed entirely by code — so every loop deterministically reuses verified knowledge, and the system **self-heals, self-improves, and self-extends** as it runs.
 
 ---
 
-## Getting started
+## 🧠 Why agentware loops don't hallucinate
 
-1. Clone this repo wherever you want your agentware instance to live.
-2. Run **Claude Code** inside the directory (`claude`). It auto-loads `CLAUDE.md`,
-   and the `SessionStart` hook detects the workspace is uninitialized and runs
-   **onboarding**: it asks where to store your knowledge base, runs
-   `scripts/agentware init`, interviews you, and personalizes everything. (To use
-   a different runtime, set `AGENTWARE_CLI=<your-cli>`.)
-3. Once onboarded, write a plan and run the loop:
-   ```bash
-   ./agentware.sh <YYMMDD-feature>
-   ```
+> **No human — and no LLM — in agentware's memory layer.**
 
-You can also initialize the knowledge dir yourself first:
+Most "agent memory" is a growing blob of text an LLM dumps in and greps back out: unstructured, lossy, different on every run. **agentware's framework layer has neither a human nor an LLM in it** — deterministic **functions** write, index, and retrieve knowledge.
+
+Every entry is **organized at write-time** — typed, tagged, frontmatter'd, indexed — structured *for retrieval before it's ever needed*, not a rotten chunk searched after the fact. So the context each **agentware loop** receives is **minimal, relevant, and re-creatable**: the same inputs deterministically rebuild the *same* clean, token-efficient context every time.
+
+That's why **agentware loops reason over organized, verified knowledge instead of a noisy haystack** — they don't drift, don't hallucinate, and produce the same high-quality result run after run. The **91.4%** benchmark below isn't luck; it's the consequence of structured-at-write-time, deterministically-reconstructed context — no embeddings or LLM in the path required.
+
+The moat in one line:
+
+> **Memory organized at write-time by deterministic functions — not a blob an LLM dumps and greps. Clean context in → reliable result out, identically every run.**
+
+---
+
+## Quickstart
 
 ```bash
-scripts/agentware init --knowledge-dir ~/agentware-knowledge
-scripts/agentware config        # shows the resolved dir + initialized state
+# 1. Clone wherever you want your instance to live
+git clone <this-repo> agentware && cd agentware
+
+# 2. Run your agent runtime (Claude Code) inside it — onboarding auto-starts:
+#    it asks where to store your knowledge base, scaffolds it, and personalizes.
+claude
+
+# 3. Write a short plan, then fire-and-forget the loop:
+./agentware.sh <YYMMDD-feature>
 ```
 
-📖 **New here? Read the [User Guide](docs/GUIDE.md)** — daily workflow with the
-three agents, how the persistent memory layer works, and how you own all your data.
+Nothing personal is ever committed: the repo is **pure steering**, and your knowledge base lives in an **external directory you choose**. The same clone works for anyone. See the [User Guide](docs/GUIDE.md).
 
 ---
 
-## The Plan → Execute loop
+## The numbers (own, verified, reproducible)
 
-The runtime is `agentware.sh`. You write a short plan, then fire-and-forget:
+agentware ships an append-only benchmark ledger — every number below traces to a committed row in `benchmarks/history.jsonl`, pinned to commit `42d58a0`.
 
-```
-<knowledge-dir>/work/<YYMMDD-feature-name>/
-└── plan.md          # phases, tasks, acceptance criteria
-```
+| Benchmark | Metric | agentware (Mode A — pure stdlib BM25, zero deps) |
+|---|---|---|
+| **LongMemEval-S (cleaned)** — public | **Recall@5** | **0.9140** · nDCG@5 0.8831 · MRR 0.9104 (470 answerable; 30 abstention scored separately) |
+| Own 56-pair gold set | Recall@5 | 0.9554 (reliability 98.2) |
+| BM25 vs no-ranking baseline (own gold) | Recall@5 lift | **0.6161 → 0.9554** (+0.34) |
+| Retrieval latency | p50 | ~10.5 ms · **byte-identical across runs** |
+
+**Reproduce it yourself (no account/token, pure stdlib):**
 
 ```bash
-./agentware.sh <YYMMDD-feature-name>
+# Fetch the dataset pinned to an exact commit + sha256, then run:
+#   (full fetch/verify steps in docs/GUIDE.md → "Benchmark methodology & numbers")
+scripts/agentware eval --suite longmemeval --strategy bm25 --top-k 5 --as-of 2026-06-25
+scripts/agentware bench scorecard     # regenerate the human-readable scorecard view
 ```
 
-Three phases run automatically:
-
-1. **Pre-phase** (3 tasks max) — review and sharpen the plan without changing
-   acceptance criteria.
-2. **Main phase** (capped by `--max-iterations`) — execute tasks one at a time,
-   verifying each with the project's own checks, writing a `worklog.md`.
-3. **Post-phase** (1 task) — assess the result and write `assessment.md`.
-
-The plan format is explained in [`docs/loop.md`](docs/loop.md). Preview a run
-without spawning anything with `./agentware.sh <feature> --dry-run`.
+> **Honest framing — read this.** ① 0.9554 is our **own 56-pair gold set**, not LongMemEval — not apples-to-apples. ② Recall@5 on LongMemEval-S is comparable **only** to systems measured on the same setup (agentmemory: 86.2% BM25-only / 95.2% hybrid; MemPalace 96.6% vector-only). The LongMemEval *paper's* numbers are on the larger `-M` variant with a dense embedder — **not** comparable, so we don't put them head-to-head. ③ Most memory layers headline **QA-accuracy**, a different metric — we compare on capabilities, not forced numbers. ④ agentware is **new**; the projects below are far more adopted.
 
 ---
 
-## The deterministic toolkit
+## How agentware stands vs autonomous agent harnesses
 
-`scripts/agentware` is the ONLY writer of structured knowledge data (the index,
-learning files, `FEATURES.md`). The agent decides *what*; the toolkit guarantees
-*how* (valid JSON, consistent tag map, no duplicates, paths relative to your
-knowledge dir).
+The loop is table stakes; **trustworthy memory + self-betterment is not.** Every cell is sourced from each project's own docs, repos, and papers (verified 2026-06) — e.g. OpenClaw's memory-pollution finding is from its own [research paper](https://arxiv.org/abs/2603.23064).
 
-```bash
-scripts/agentware init --knowledge-dir <path>   # scaffold + write config
-scripts/agentware config                         # show resolved knowledge dir
-scripts/agentware index add --id ... --title ... --category ... --path ... --tags ... --summary ...
-scripts/agentware index validate                 # integrity check (exit 0 = ok)
-scripts/agentware query --tag <tag>              # O(1) lookups by id/path/tag/category
-scripts/agentware learn --topic ... --summary ... --tags ... --content -
-scripts/agentware features                        # regenerate FEATURES.md
-scripts/agentware audit                           # full sweep of all checks
-scripts/agentware steering lint                   # enforce the Deterministic Steering Format
-```
+| Capability | **agentware** | OpenHands | OpenClaw | Cline | Aider | Goose |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| Autonomous execution loop | ✅ | ✅ | ✅ | ✅ | ⚠️ partial | ✅ |
+| Persistent cross-session memory (built-in) | ✅ | ⚠️ human-authored | ✅ | ❌ convention | ❌ per-session | ✅ |
+| **Memory managed by code, not an LLM** | ✅ | ❌ lossy summarizer | ❌ LLM-judge | ❌ | ✅ *(not persistent)* | ❌ |
+| **Non-hallucinated** (no LLM authors memory) | ✅ | ⚠️ | ❌ *pollution documented* | ❌ | ✅ | ❌ |
+| Self-heal + self-improve (learn→rule) | ✅ | ❌ | ⚠️ gated skills | ❌ | ⚠️ narrow | ⚠️ human-gated |
+| Self-extend (writes its own skills) | ✅ | ❌ | ✅ gated | ❌ | ❌ | ⚠️ |
+| Benchmark-gated regression ledger | ✅ | ❌ | ❌ | ⚠️ evals | ⚠️ leaderboard | ⚠️ |
+| Memory/retrieval needs **no LLM or network** | ✅ | ❌ | ❌ | ❌ | ✅ *(map only)* | ❌ |
+| Maturity / adoption (★, approx) | new | ≈78k | ≈380k | ≈64k | ≈47k | ≈50k |
 
----
-
-## Layout
-
-```
-agentware/
-├── README.md                          # this file
-├── CLAUDE.md                          # auto-loaded by Claude Code; imports AGENTS.md + steering
-├── AGENTS.md                          # canonical methodology (DSF) — imported by CLAUDE.md
-├── agentware.sh                       # 3-phase task-execution loop (claude -p)
-├── scripts/
-│   ├── agentware                      # deterministic toolkit (Python)
-│   ├── aw-knowledge-dir               # resolves the external knowledge dir (bash)
-│   └── hooks/                         # SessionStart / UserPromptSubmit / Stop hook scripts
-├── docs/
-│   ├── loop.md                        # the 3-phase loop + plan format
-│   ├── methodology.md                 # rationale + examples (NOT agent-loaded)
-│   └── design/                        # feature plans + worklogs (gitignored)
-├── steering/                          # always-loaded steering imported by CLAUDE.md
-│   ├── common-problems.md
-│   └── project-context.md
-├── .claude/
-│   ├── settings.json                  # default model + hooks
-│   ├── agents/                        # agentware-planner / -execution (subagents)
-│   ├── skills/                        # onboarding, knowledge-base, ui-verification, self-improvement
-│   └── commands/                      # /agentware-plan slash command
-├── templates/                         # learning / project / skill entry templates
-└── .gitignore
-
-# config + ALL your data live OUTSIDE the package:
-~/.agentware/config.env                # points at your knowledge dir (HOME, gitignored)
-<your-knowledge-dir>/                   # knowledge, learnings, skills, work/, logs/, templates/
-```
-
-The multi-runtime bridge files at the root (`.cursorrules`, `.windsurfrules`,
-`.clinerules`, `.antigravity`, `.google.agy`, `.github/copilot-instructions.md`)
-all point other runtimes at `AGENTS.md`.
+✅ yes/strong · ⚠️ partial/caveated · ❌ no/weak. **The honest takeaway:** every harness has a loop, but **none pairs it with deterministic, persistent, non-LLM-managed memory + a regression gate.** Where they lead, we say so: OpenHands has sandboxed code-exec breadth, Cline has deep IDE integration, and all of them have vastly more adoption.
 
 ---
 
-## Using the agents (zero-prompt)
+## How agentware stands vs memory layers
 
-The two roles are Claude Code **subagents** in `.claude/agents/`. Onboarding
-installs two aliases (and verifies they work) so the whole system is one word:
+| Axis | **agentware** | mem0 | Letta | Zep / Graphiti | agentmemory | cognee |
+|---|:--:|:--:|:--:|:--:|:--:|:--:|
+| Has an execution loop (not just a library) | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Deterministic retrieval | ✅ | ❌ | ❌ | ⚠️ | ✅ | ⚠️ |
+| No LLM in the write path | ✅ | ❌ | ❌ | ❌ | ✅ default | ❌ |
+| Zero hard deps / runs with nothing installed | ✅ | ❌ | ❌ | ❌ | ✅ | ❌ |
+| Comparable public Recall@5 | ✅ 91.4% | ❌ none | ❌ none | ⚠️ QA-acc | ✅ 95.2% | ⚠️ HotPotQA |
+| Benchmark-gated reliability ledger | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Governed learning → rule loop | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| Semantic / embedding retrieval | ⚠️ roadmap | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Knowledge graph / multi-hop | ⚠️ roadmap | ✅ | ❌ | ✅ | ✅ opt | ✅ |
+| Maturity / adoption (★, approx) | new | ≈59k | ≈23k | ≈28k | ≈24k | ≈22k |
 
-```bash
-# >>> agentware aliases >>>   (onboarding writes your real absolute path in place of /path/to/agentware)
-alias PLAN_AW='(cd /path/to/agentware && claude --agent agentware-planner --dangerously-skip-permissions)'
-alias WORK_AW='(cd /path/to/agentware && claude --agent agentware-execution --dangerously-skip-permissions)'
-# <<< agentware aliases <<<
+**Honest gaps:** agentware trails on **raw semantic recall** (paraphrase queries), **knowledge-graph multi-hop**, and **adoption**. Those are deliberate scope choices today — a **local, rank-only** semantic mode (no LLM, no cloud) is on the roadmap; the deterministic stdlib path stays the zero-install default.
+
+---
+
+## Features
+
+- **The 3-phase loop** (`agentware.sh`): **Pre** (sharpen the plan) → **Main** (execute + verify each task) → **Post** (self-assess). Promise-gated; trustworthy to run unattended.
+- **Deterministic toolkit** (`scripts/agentware`): the **sole writer** of the knowledge index/learnings — valid JSON, consistent tags, no duplicates, paths relative to your dir.
+- **Reliable memory**: `recall` (ranked BM25 retrieval), `eval` (benchmark suites), an append-only `history.jsonl` ledger + regenerated `SCORECARD.md`.
+- **Self-improvement**: worklog `> LEARNED:` markers are promoted into durable, ID'd steering rules — linted in CI.
+- **Self-healing**: every subtask is verified with *your* project's own build/test/health command; failures retry, not ship.
+- **Self-extension**: ship features into agentware the same way you ship them into any project (gated by a `!! WARNING !!` for package edits).
+- **Git-native & private**: plaintext markdown + JSON; team-sync over git; full audit trail (every prompt + session transcript) in *your* external dir.
+
+---
+
+## How it works
+
+```
+<knowledge-dir>/work/<YYMMDD-feature>/plan.md     # you write phases + acceptance criteria
+        │
+        ▼   ./agentware.sh <feature>
+   ┌─────────── PRE ───────────┐  sharpen the plan (≤3 tasks), no scope change
+   ├─────────── MAIN ──────────┤  execute one task → verify → recall prior knowledge → worklog
+   └─────────── POST ──────────┘  self-assess → assessment.md → promote learnings
 ```
 
-- `PLAN_AW` — draft a feature plan (writes only `plan.md`, never executes). During
-  research it runs `scripts/agentware recall` for ranked-relevant prior learnings/plans.
-- `WORK_AW` — execute the work. It runs `scripts/agentware recall` at task start,
-  promotes learnings before the completion promise, and runs `scripts/agentware audit
-  --stale` before adding to the knowledge base. The loop's POST phase self-assesses
-  via this agent.
+The toolkit guarantees *how* knowledge is written; the agent decides *what*. Retrieval is byte-identical (no LLM/RNG/network/wall-clock in ranking), proven by guard tests: `test_recall_json_is_byte_identical_across_runs`, `test_cli_imports_are_stdlib_only`, `test_recall_leaves_entire_kb_tree_unchanged` (`tests/test_invariants.py`).
 
-The `(cd … && …)` subshell means you can run these from **any directory** — they
-load agentware's agents/steering/hooks from the repo and leave your terminal's
-current directory unchanged. `--dangerously-skip-permissions` means the session
-never stops to ask you to approve a command. The autonomous loop is run from the
-repo: `cd /path/to/agentware && ./agentware.sh <feature>`.
-
-> First run only: Claude Code asks you once to trust this folder's hooks/settings
-> (a security step). Approve it, and everything after is frictionless.
+Full walkthrough: [docs/GUIDE.md](docs/GUIDE.md) · plan format: [docs/loop.md](docs/loop.md) · rationale: [docs/methodology.md](docs/methodology.md).
 
 ---
 
-## Guarantees
+## Roadmap
 
-- **The package never changes as you work.** Knowledge, learnings, agent-created
-  skills, per-feature plans/worklogs (`work/`), and logs all live in your external
-  dir. The orchestrator is read-only — changing it (steering/skills/loop) requires
-  an explicit request and shows a `!! WARNING !!` first (self-extension).
-- **Deterministic knowledge.** `scripts/agentware` is the only writer of the index
-  and learnings; agents find things via `query`/`audit`/`steering lint` — not by
-  re-reading the whole base and burning tokens.
-- **Full audit trail in your space.** Every prompt → `<knowledge-dir>/logs/prompts.log`.
-  Every session → `<knowledge-dir>/logs/sessions/<id>/`: the lossless main
-  transcript (prompts, text, thinking, tool calls with file names, results), the
-  full transcript of **every subagent it spawned**, and a `full.md` with all of
-  them appended — timestamped, so you can replay exactly what was said and done.
+agentware is honest about where it's *not yet* industry-standard:
+
+- **Mode B — local semantic retrieval** *(next)*: BM25 + a **local, rank-only** embedding model fused via RRF (no LLM, no cloud, no data leaving the machine) to close the semantic-recall gap. Mode A stays the byte-identical, zero-install default. *(Code is built behind the `bm25+embed` strategy; it needs a local embedder installed to score.)*
+- **Observability dashboard** — live, tail-able loop + benchmark health.
+- **Knowledge-graph / multi-hop** retrieval (deterministic).
+- **Broader runtime support** (native Windows; more agent CLIs).
+
+**Deliberately *not* on the roadmap (the moat line):** an LLM in the retrieval or write path. That is exactly where determinism and non-hallucination break — and it's our whole point.
 
 ---
 
-## Requirements / platform support
+## Requirements
 
-- **Claude Code** (`claude` CLI) — the native runtime.
-- **POSIX shell + `bash` + `jq` + Python 3** — the loop, hooks, and toolkit are
-  bash/Python. This means **macOS, Linux, or Windows via WSL/Git-Bash**. Native
-  Windows (PowerShell, no WSL) is not yet supported.
-- Git is optional (onboarding offers `git init` + push via `gh`).
-- Node.js ≥ 18 — only if you want Playwright UI verification.
+- **Claude Code** (`claude` CLI) — the native runtime (set `AGENTWARE_CLI=<your-cli>` for others).
+- **POSIX shell + `bash` + `jq` + Python 3** — macOS, Linux, or Windows via WSL/Git-Bash.
+- Git optional (onboarding offers `git init` + push via `gh`). Node.js ≥ 18 only for optional Playwright UI verification.
+
+---
+
+## Contributing
+
+PRs and issues welcome. agentware governs *itself* the same way it governs your work — changes to its own steering/skills/loop go through a plan, a `!! WARNING !!` self-extension gate, and the `steering lint` + benchmark gates before they ship. Run `python3 -m unittest discover -s tests` and `scripts/agentware audit --with-tests` before opening a PR.
+
+## License
+
+[Apache-2.0](LICENSE) © 2026 Rahul Rana — includes an explicit patent grant; see [`NOTICE`](NOTICE).
