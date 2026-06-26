@@ -73,6 +73,30 @@ _RETRIEVAL_MODE_DETERMINISTIC_TOKENS = (
 _RETRIEVAL_MODE_SEMANTIC_TOKENS = (
     "semantic", "b", "embed", "hybrid", "local", "modeb", "mode-b")
 
+# Workspace KB mode (feature 260625-team-mode-onboarding-fork). DISTINCT from the
+# retrieval mode above: this records whether the operator runs a SOLO local KB
+# ('power') or a SHARED git KB with per-user provenance ('team'). Named
+# AGENTWARE_KB_MODE / --set-kb-mode / --kb-mode-only to avoid colliding with the
+# pre-existing retrieval `--set-mode` (deterministic|semantic). Resolution
+# precedence: AGENTWARE_KB_MODE env -> config.env -> default 'power' (today's
+# solo behavior, byte-unchanged). This setting steers ONBOARDING only; it changes
+# no ranking math (INV-1).
+KB_MODE_KEY = "AGENTWARE_KB_MODE"
+KB_MODE_POWER = "power"
+KB_MODE_TEAM = "team"
+KB_MODE_DEFAULT = KB_MODE_POWER
+_KB_MODE_POWER_TOKENS = ("power", "p", "solo", "local", "personal", "default")
+_KB_MODE_TEAM_TOKENS = ("team", "t", "shared", "git", "group")
+
+# Per-user provenance handle (feature 260625-team-mode-onboarding-fork). In a
+# SHARED (team) KB many humans write to one index, so each writer stamps their
+# OWN handle as the entry `author` — distinct from the KB-wide `**Handle**:` in
+# MAIN.md (the _operator_handle default). Resolution precedence:
+# AGENTWARE_USER_HANDLE env -> config.env -> None (fall back to _operator_handle).
+# Stored ONLY in ~/.agentware/config.env + external-KB frontmatter, NEVER in the
+# package (R-LOC-03).
+USER_HANDLE_KEY = "AGENTWARE_USER_HANDLE"
+
 # Pluggable LOCAL embedder backend (feature 260625-semantic-retrieval-benchmark,
 # Phase 3.2). Mode B (semantic) needs a LOCAL embedding model. The backend is
 # OPTIONAL and NEVER hard-imported: it is resolved from a runtime config string
@@ -357,6 +381,88 @@ def resolve_retrieval_mode():
     if cfg is not None:
         return cfg
     return RETRIEVAL_MODE_DEFAULT
+
+
+def _parse_kb_mode(raw):
+    """Map a raw setting to 'power'/'team', or None if empty/unrecognized.
+
+    An unrecognized non-empty value returns None so the caller falls through to
+    the next precedence tier (ultimately the safe 'power' default) — a typo never
+    silently flips a solo operator into team semantics.
+    """
+    if raw is None:
+        return None
+    v = raw.strip().strip('"').strip("'").lower()
+    if not v:
+        return None
+    if v in _KB_MODE_TEAM_TOKENS:
+        return KB_MODE_TEAM
+    if v in _KB_MODE_POWER_TOKENS:
+        return KB_MODE_POWER
+    return None
+
+
+def _parse_kb_mode_strict(raw):
+    """Strict parse for `config --set-kb-mode`: only recognized tokens, else None."""
+    v = (raw or "").strip().strip('"').strip("'").lower()
+    if v in _KB_MODE_TEAM_TOKENS:
+        return KB_MODE_TEAM
+    if v in _KB_MODE_POWER_TOKENS:
+        return KB_MODE_POWER
+    return None
+
+
+def resolve_kb_mode():
+    """Resolve the configured workspace KB mode ('power' | 'team').
+
+    Precedence: AGENTWARE_KB_MODE env -> config.env -> default 'power'. Steers
+    onboarding only; never touches ranking (INV-1).
+    """
+    env = _parse_kb_mode(os.environ.get(KB_MODE_KEY))
+    if env is not None:
+        return env
+    cfg = _parse_kb_mode(_read_config_key(KB_MODE_KEY))
+    if cfg is not None:
+        return cfg
+    return KB_MODE_DEFAULT
+
+
+def _normalize_user_handle(raw):
+    """Sanitize a per-user handle into a safe single config token, or None.
+
+    Strips surrounding quotes/whitespace, collapses internal whitespace to '-'
+    (so a multi-word handle can't corrupt the `KEY=VALUE` config line), and drops
+    characters outside a conservative `[A-Za-z0-9._-]` allowlist. Returns None for
+    an empty/all-stripped result so the caller can reject it.
+    """
+    if raw is None:
+        return None
+    v = raw.strip().strip('"').strip("'").strip()
+    if not v:
+        return None
+    v = re.sub(r"\s+", "-", v)
+    v = re.sub(r"[^A-Za-z0-9._-]", "", v)
+    # Require at least one alphanumeric: a handle that collapses to only
+    # separators (e.g. "!!! @@@" -> "-") is not a usable provenance handle.
+    if not re.search(r"[A-Za-z0-9]", v):
+        return None
+    return v
+
+
+def resolve_user_handle():
+    """Resolve the per-user provenance handle, or None if unset.
+
+    Precedence: AGENTWARE_USER_HANDLE env -> config.env -> None. None means the
+    writer falls back to _operator_handle(kdir) — byte-identical to pre-team
+    behavior.
+    """
+    env = _normalize_user_handle(os.environ.get(USER_HANDLE_KEY))
+    if env:
+        return env
+    cfg = _normalize_user_handle(_read_config_key(USER_HANDLE_KEY))
+    if cfg:
+        return cfg
+    return None
 
 
 def resolve_embedder_backend():
@@ -1318,6 +1424,79 @@ def cmd_config(args):
                 print("Notice: %s" % notice)
         return 0
 
+    # --set-kb-mode power|team: persist the WORKSPACE mode (distinct from the
+    # retrieval --set-mode above) to ~/.agentware/config.env, then report.
+    kb_mode_val = getattr(args, "set_kb_mode", None)
+    if kb_mode_val is not None:
+        norm = _parse_kb_mode_strict(kb_mode_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-kb-mode value %r (use power|team)\n"
+                % kb_mode_val)
+            return 2
+        _set_config_value(KB_MODE_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "kb_mode": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (workspace KB mode %s)"
+                  % (KB_MODE_KEY, norm, HOME_CONFIG, norm))
+        return 0
+
+    # --set-user-handle <h>: persist the per-user provenance handle. Sanitized to
+    # a safe single token; an all-invalid handle is rejected (no config corruption).
+    handle_val = getattr(args, "set_user_handle", None)
+    if handle_val is not None:
+        norm = _normalize_user_handle(handle_val)
+        if not norm:
+            sys.stderr.write(
+                "agentware: invalid --set-user-handle value %r "
+                "(must contain at least one of A-Z a-z 0-9 . _ -)\n" % handle_val)
+            return 2
+        _set_config_value(USER_HANDLE_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "user_handle": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (per-user provenance handle)"
+                  % (USER_HANDLE_KEY, norm, HOME_CONFIG))
+        return 0
+
+    # --kb-mode-only: bare resolved workspace mode for shell consumers (onboarding).
+    if getattr(args, "kb_mode_only", False):
+        print(resolve_kb_mode())
+        return 0
+
+    # --user-handle-only: bare resolved per-user handle (empty if unset).
+    if getattr(args, "user_handle_only", False):
+        h = resolve_user_handle()
+        if h:
+            print(h)
+        return 0
+
+    # --record-onboarding: append one onboarding event to <kdir>/logs/metrics.jsonl
+    # (Rule-7 observability; gitignored, best-effort). Onboarding calls this on
+    # completion so the dashboard can chart mode adoption.
+    if getattr(args, "record_onboarding", False):
+        kdir = resolve_knowledge_dir()
+        if not kdir:
+            sys.stderr.write("agentware: no knowledge dir configured\n")
+            return 1
+        mode = resolve_kb_mode()
+        handle = resolve_user_handle()
+        wrote = emit_onboarding_metric(kdir, mode, handle)
+        if as_json:
+            json.dump({"ok": wrote, "event": "onboarding", "mode": mode,
+                       "user_handle": handle}, sys.stdout, ensure_ascii=False,
+                      indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Recorded onboarding event (mode=%s, user_handle=%s) -> "
+                  "%s/logs/metrics.jsonl" % (mode, handle or "<unset>", kdir))
+        return 0
+
     # --retrieval-mode-only: bare EFFECTIVE mode for shell consumers (the loop /
     # Phase 7 wiring). Any fallback notice goes to stderr so stdout stays a clean
     # single token for capture.
@@ -1337,12 +1516,15 @@ def cmd_config(args):
     autocommit = resolve_kb_autocommit()
     retrieval_mode = resolve_retrieval_mode()
     eff_mode, mode_fell_back, _mode_notice = resolve_effective_retrieval_mode()
+    kb_mode = resolve_kb_mode()
+    user_handle = resolve_user_handle()
     initialized = bool(kdir) and os.path.isfile(os.path.join(kdir, SENTINEL_REL))
     if as_json:
         json.dump({"knowledge_dir": kdir, "configured": bool(kdir),
                    "initialized": initialized, "kb_autocommit": autocommit,
                    "retrieval_mode": retrieval_mode,
                    "effective_retrieval_mode": eff_mode,
+                   "kb_mode": kb_mode, "user_handle": user_handle,
                    "embedder_backend": resolve_embedder_backend(),
                    "embed_model": resolve_embed_model(),
                    "semantic_embedder_available": semantic_embedder_available()},
@@ -1357,15 +1539,20 @@ def cmd_config(args):
     mode_line = "retrieval_mode: %s" % retrieval_mode
     if mode_fell_back:
         mode_line += " (effective: %s — no local model)" % eff_mode
+    handle_line = "user_handle:   %s" % (user_handle or "<unset>")
     if kdir:
         print("knowledge_dir: %s" % kdir)
         print("initialized:   %s" % ("yes" if initialized else "no"))
         print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
         print(mode_line)
+        print("kb_mode:       %s" % kb_mode)
+        print(handle_line)
         return 0
     print("knowledge_dir: <unconfigured>")
     print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
     print(mode_line)
+    print("kb_mode:       %s" % kb_mode)
+    print(handle_line)
     return 1
 
 
@@ -1742,6 +1929,148 @@ def cmd_index_rebuild(args):
             sys.stderr.write("agentware: vector cache not rebuilt (%s); Mode A "
                              "unaffected.\n" % vc.get("reason"))
     return 0
+
+
+# --- Attach-existing-repo conformance (feature 260625-team-mode-onboarding-fork) ---
+# Team-mode onboarding can ADOPT an existing repo as the shared KB. Before doing
+# so it must confirm the repo conforms to the framework layout, or a malformed KB
+# would silently break recall/rebuild for the whole team. This check is READ-ONLY
+# (INV-2): it inspects structure, validates the index, and confirms `index rebuild`
+# would be a parity NO-OP (the committed index.json already equals what its entry
+# frontmatter would produce) WITHOUT writing anything. A non-conformant repo is
+# refused with a clear reason; the idempotent migration path (cmd_init scaffold)
+# can fill missing STRUCTURE.
+ATTACH_REQUIRED_DIRS = KNOWLEDGE_SUBDIRS + ("work", "logs")
+
+
+def _index_parity_errors(committed, rebuilt):
+    """Return [] iff `index rebuild` would not CHANGE any committed data.
+
+    Parity is the no-op property: rebuilding from frontmatter must neither drop
+    nor alter what the committed index.json already asserts. Rebuild ADDING a
+    purely-defaulted field an entry lacked (e.g. `last_verified` == `created`,
+    which a fresh `learn` entry omits until the first rebuild) is a benign no-op,
+    NOT a divergence — so the check compares the committed entry set + the values
+    committed actually carries, and ignores extra defaulted keys rebuild fills in.
+    A different entry set, a dropped entry, or a changed committed value FAILS.
+    """
+    errs = []
+    cmap = {e.get("id"): e for e in (committed.get("entries") or [])}
+    rmap = {e.get("id"): e for e in (rebuilt.get("entries") or [])}
+    only_c = sorted(set(cmap) - set(rmap))
+    only_r = sorted(set(rmap) - set(cmap))
+    if only_c:
+        errs.append("entries in index.json not derivable from frontmatter: %s"
+                    % ", ".join(only_c))
+    if only_r:
+        errs.append("entries derivable from frontmatter but absent from "
+                    "index.json: %s" % ", ".join(only_r))
+    for eid in sorted(set(cmap) & set(rmap)):
+        c, r = cmap[eid], rmap[eid]
+        for k, v in c.items():
+            if r.get(k) != v:
+                errs.append("entry %r field %r diverges: index.json=%r vs "
+                            "frontmatter=>%r" % (eid, k, v, r.get(k)))
+    return errs
+
+
+def attach_conformance_report(path):
+    """Read-only conformance check for adopting `path` as the KB. (ok, report).
+
+    Checks, in order: (1) expected dirs present (KNOWLEDGE_SUBDIRS + work/ + logs/);
+    (2) index.json present and `validate_index` passes; (3) `index rebuild` is a
+    parity no-op (the committed index equals what entry frontmatter would rebuild).
+    NEVER mutates `path`. `report` carries `missing_dirs`, `index_errors`,
+    `parity_errors`, and a human `summary`.
+    """
+    report = {"path": path, "missing_dirs": [], "index_errors": [],
+              "parity_errors": [], "ok": False, "summary": ""}
+    if not os.path.isdir(path):
+        report["index_errors"] = ["not a directory: %s" % path]
+        report["summary"] = "refused: %s is not a directory" % path
+        return False, report
+
+    report["missing_dirs"] = [
+        d for d in ATTACH_REQUIRED_DIRS
+        if not os.path.isdir(os.path.join(path, d))]
+
+    data, err = load_index(path)
+    if err is not None:
+        report["index_errors"] = [err]
+    else:
+        report["index_errors"] = validate_index(path, data)
+        # Parity: rebuild-from-frontmatter must equal the committed index. Pure,
+        # read-only — build_index_from_frontmatter writes nothing.
+        rebuilt, rerrs = build_index_from_frontmatter(path)
+        if rerrs:
+            report["parity_errors"] = rerrs
+        else:
+            report["parity_errors"] = _index_parity_errors(data, rebuilt)
+
+    report["ok"] = not (report["missing_dirs"] or report["index_errors"]
+                        or report["parity_errors"])
+    if report["ok"]:
+        report["summary"] = "conformant: safe to adopt %s as the shared KB" % path
+    else:
+        bits = []
+        if report["missing_dirs"]:
+            bits.append("missing dirs: %s" % ", ".join(report["missing_dirs"]))
+        if report["index_errors"]:
+            bits.append("index: %s" % "; ".join(report["index_errors"]))
+        if report["parity_errors"]:
+            bits.append("rebuild parity: %s" % "; ".join(report["parity_errors"]))
+        report["summary"] = "refused: " + " | ".join(bits)
+    return report["ok"], report
+
+
+def _attach_migrate_structure(path):
+    """Idempotently fill MISSING KB structure (dirs/rosters; seed index if absent).
+
+    Mirrors the dir/roster/index-seed portion of `cmd_init` but writes NO HOME
+    config and clobbers nothing existing — so it can repair an attach candidate
+    in place. Returns the list of created dirs.
+    """
+    created = []
+    for sub in ("",) + KNOWLEDGE_SUBDIRS + NON_INDEXED_DIRS:
+        d = os.path.join(path, sub) if sub else path
+        if not os.path.isdir(d):
+            os.makedirs(d, exist_ok=True)
+            created.append(sub or ".")
+    ipath = index_path(path)
+    if not os.path.exists(ipath):
+        save_index(path, {"entries": [], "tags": {}})
+    for sub in KNOWLEDGE_SUBDIRS:
+        roster = os.path.join(path, sub, "index.md")
+        if not os.path.exists(roster):
+            with open(roster, "w", encoding="utf-8") as f:
+                f.write("# %s\n\n_Index of %s._\n" % (sub.capitalize(), sub))
+    return created
+
+
+def cmd_attach(args):
+    """Validate (and optionally migrate) a candidate repo for adoption as the KB.
+
+    `--migrate` first fills missing STRUCTURE idempotently (never clobbers data),
+    then re-validates. Exit 0 iff conformant. Read-only without `--migrate`.
+    """
+    path = os.path.abspath(os.path.expanduser(args.path))
+    migrated = []
+    if getattr(args, "migrate", False):
+        migrated = _attach_migrate_structure(path)
+    ok, report = attach_conformance_report(path)
+    report["migrated_dirs"] = migrated
+    if getattr(args, "format", "text") == "json":
+        json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        if ok:
+            print("ATTACH OK: %s" % report["summary"])
+        else:
+            print("ATTACH REFUSED: %s" % report["summary"])
+            if not getattr(args, "migrate", False) and report["missing_dirs"]:
+                print("  hint: re-run with --migrate to fill missing structure "
+                      "(idempotent; never clobbers data).")
+    return 0 if ok else 1
 
 
 # --- Declared-edge knowledge graph (deterministic, read-only) ----------------
@@ -2436,6 +2765,33 @@ def cmd_learn(args):
         sys.stderr.write("agentware: --content must not be empty\n")
         return 1
 
+    # Optional provenance passthrough (feature 260625-team-mode-onboarding-fork).
+    # Backward-compat invariant: when BOTH are omitted the frontmatter is
+    # byte-identical to today — `source` stays DEFAULT_ENTRY_SOURCE and `author`
+    # defaults to the per-user handle if configured, else _operator_handle(kdir)
+    # (which is exactly today's behavior when no per-user handle is set).
+    src = getattr(args, "source", None)
+    if src is not None:
+        src_norm = src.strip().lower()
+        if src_norm not in ACR_SOURCE_WEIGHTS:
+            sys.stderr.write(
+                "agentware: invalid --source %r (use %s)\n"
+                % (src, "|".join(sorted(ACR_SOURCE_WEIGHTS))))
+            return 1
+        src = src_norm
+    else:
+        src = DEFAULT_ENTRY_SOURCE
+    author = getattr(args, "author", None)
+    if author is not None:
+        author = _normalize_user_handle(author)
+        if not author:
+            sys.stderr.write(
+                "agentware: invalid --author (must contain at least one of "
+                "A-Z a-z 0-9 . _ -)\n")
+            return 1
+    else:
+        author = resolve_user_handle()  # None => build_entry_frontmatter uses _operator_handle
+
     eid = "learn-%s" % topic
     rel_path = "%s/%s.md" % (LEARNINGS_REL, topic)
     abs_path = os.path.join(kdir, rel_path)
@@ -2459,7 +2815,7 @@ def cmd_learn(args):
     fm = build_entry_frontmatter(
         {"id": eid, "title": title, "category": "learnings", "tags": tag_list,
          "created": created, "summary": args.summary},
-        kdir, source=DEFAULT_ENTRY_SOURCE)
+        kdir, author=author, source=src)
     os.makedirs(learnings_dir(kdir), exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(_render_learning(fm, body))
@@ -9164,6 +9520,71 @@ def _audit_bm25_cache_check(kdir, data):
     }
 
 
+def provenance_coverage(kdir, data):
+    """Return (missing_author_ids, total) over indexed entries (READ-ONLY).
+
+    An entry "has provenance" when its file frontmatter carries a non-empty
+    `author`. In a SHARED (team) KB this attributes each learning to the member
+    who wrote it; missing-`author` entries are the gap the provenance-mix panel
+    surfaces. Stdlib-only, no clock/network. Feature 260625-team-mode-onboarding-fork.
+    """
+    missing, total = [], 0
+    for e in (data.get("entries") or []):
+        rel = e.get("path")
+        if not rel:
+            continue
+        total += 1
+        fm = read_entry_frontmatter(os.path.join(kdir, rel))
+        if not (fm.get("author") or "").strip():
+            missing.append(e.get("id") or rel)
+    return missing, total
+
+
+def _audit_provenance_coverage_check(kdir, data):
+    """Per-user provenance coverage (Rule 7 observability; advisory in power mode).
+
+    Reports indexed entries whose frontmatter lacks an `author`. In TEAM mode this
+    FAILS the check so a shared KB cannot silently lose attribution; in POWER mode
+    it is purely INFORMATIONAL (never flips `ok` — a solo KB predating provenance
+    is fine). Read-only w.r.t. the KB/index (INV-2).
+    """
+    missing, total = provenance_coverage(kdir, data)
+    mode = resolve_kb_mode()
+    ok = (not missing) or (mode != KB_MODE_TEAM)
+    if not missing:
+        details = ["full coverage: %d/%d indexed entr(y/ies) carry an `author`"
+                   % (total, total)]
+    else:
+        covered = total - len(missing)
+        sev = "FAIL (team mode)" if mode == KB_MODE_TEAM else "advisory (power mode)"
+        details = ["%s: %d/%d entr(y/ies) missing `author` provenance: %s"
+                   % (sev, len(missing), total, ", ".join(sorted(missing)[:20]))]
+        if covered:
+            details.append("%d/%d already attributed" % (covered, total))
+    return {"name": "provenance_coverage", "ok": ok, "details": details}
+
+
+def emit_onboarding_metric(kdir, mode, user_handle=None, ts=None):
+    """Rule-7 observability: append one `onboarding` event to logs/metrics.jsonl.
+
+    Best-effort + read-only w.r.t. the KB/index (INV-2): a write failure never
+    blocks onboarding. `logs/` is gitignored, so this never reaches the remote.
+    Shape: {ts, event:"onboarding", mode, user_handle}. Feature
+    260625-team-mode-onboarding-fork.
+    """
+    try:
+        rec = {"event": "onboarding", "mode": mode,
+               "user_handle": user_handle, "ts": ts or utc_now_iso()}
+        logs = os.path.join(kdir, "logs")
+        os.makedirs(logs, exist_ok=True)
+        with open(os.path.join(logs, "metrics.jsonl"), "a",
+                  encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, sort_keys=True) + "\n")
+        return True
+    except OSError:
+        return False
+
+
 def _audit_personal_data_check(kdir):
     """R-LOC-03 guard: the package must ship ZERO operator personal data.
 
@@ -9369,6 +9790,7 @@ def cmd_audit(args):
             _audit_personal_data_check(kdir),
             _audit_bm25_cache_check(kdir, data),
             _audit_graph_integrity_check(kdir, data),
+            _audit_provenance_coverage_check(kdir, data),
         ]
         # Rule-7 observability: advisory graph-health signal (append-only,
         # gitignored, read-only w.r.t. the KB/index).
@@ -12085,7 +12507,41 @@ def build_parser():
                        help="persist the retrieval mode to ~/.agentware/config.env "
                             "(Mode A deterministic / Mode B semantic; env still "
                             "overrides per-run)")
+    p_cfg.add_argument("--kb-mode-only", action="store_true",
+                       dest="kb_mode_only",
+                       help="print only the resolved workspace KB mode "
+                            "(power|team) for shell consumers (onboarding)")
+    p_cfg.add_argument("--set-kb-mode", dest="set_kb_mode",
+                       metavar="power|team",
+                       help="persist the workspace KB mode to ~/.agentware/config.env "
+                            "(power=solo local KB / team=shared git KB; distinct "
+                            "from the retrieval --set-mode; env overrides per-run)")
+    p_cfg.add_argument("--user-handle-only", action="store_true",
+                       dest="user_handle_only",
+                       help="print only the resolved per-user provenance handle "
+                            "(empty if unset)")
+    p_cfg.add_argument("--set-user-handle", dest="set_user_handle",
+                       metavar="HANDLE",
+                       help="persist the per-user provenance handle to "
+                            "~/.agentware/config.env (stamped as `author` on "
+                            "entries this user creates in a shared team KB)")
+    p_cfg.add_argument("--record-onboarding", action="store_true",
+                       dest="record_onboarding",
+                       help="append one onboarding event {mode,user_handle} to "
+                            "<kdir>/logs/metrics.jsonl (gitignored observability)")
     p_cfg.set_defaults(func=cmd_config)
+
+    # attach -----------------------------------------------------------------
+    p_attach = sub.add_parser(
+        "attach", parents=[fmt_parent],
+        help="validate (and optionally --migrate) a candidate repo for adoption "
+             "as the shared KB (team-mode onboarding)")
+    p_attach.add_argument("--path", required=True,
+                          help="path to the candidate KB repo to validate")
+    p_attach.add_argument("--migrate", action="store_true",
+                          help="idempotently fill missing structure first "
+                               "(never clobbers existing data), then validate")
+    p_attach.set_defaults(func=cmd_attach)
 
     # index ------------------------------------------------------------------
     p_index = sub.add_parser("index", help="manage the knowledge index.json")
@@ -12158,6 +12614,13 @@ def build_parser():
     p_learn.add_argument("--tags", required=True, help="comma-separated tags")
     p_learn.add_argument("--content", required=True,
                          help="learning body, or '-' to read from stdin")
+    p_learn.add_argument("--author", default=None,
+                         help="optional provenance author handle (default: the "
+                              "per-user handle if set, else the operator handle). "
+                              "For shared/team KBs.")
+    p_learn.add_argument("--source", default=None,
+                         help="optional provenance source: user|agent|imported "
+                              "(default: agent). Feeds the ACR source_weight prior.")
     p_learn.set_defaults(func=cmd_learn)
 
     # decide -----------------------------------------------------------------

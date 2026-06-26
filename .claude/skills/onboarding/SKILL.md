@@ -105,6 +105,39 @@ This is the defining step of agentware. Do it before anything else.
    knowledge files INTO this directory (call it `$KDIR` below). Resolve it any
    time with `scripts/agentware config --knowledge-dir-only`.
 
+5. **Choose the workspace mode (power-user vs team-mode).** This decides whether
+   the KB is a solo local store or a shared, git-versioned store with per-user
+   provenance. It is DISTINCT from the retrieval mode in Step 7b-2 (that is
+   `deterministic|semantic`); this is `power|team` and resolves env
+   (`AGENTWARE_KB_MODE`) → config → **default `power`**.
+
+   Ask:
+   > "Will this knowledge base be **just you** (power-user — a local KB, today's
+   > default), or **shared by a team** (team-mode — a shared **git** KB where each
+   > member's learnings are attributed to them)? [recommend git for teams]"
+
+   - Persist the choice with the toolkit (the ONLY writer of the setting):
+     ```bash
+     scripts/agentware config --set-kb-mode power   # or: team
+     ```
+     Confirm it landed: `scripts/agentware config --kb-mode-only` (prints `power`
+     or `team`).
+   - **If team-mode**, also capture this user's **per-user provenance handle** —
+     the name stamped as `author` on entries THEY create in the shared KB (distinct
+     from the KB-wide `**Handle**:` in MAIN.md). Use the handle from the Step 3
+     interview (ask now if you must):
+     ```bash
+     scripts/agentware config --set-user-handle <handle>
+     ```
+     Confirm: `scripts/agentware config --user-handle-only`. From now on, when you
+     create team learnings with `learn`, pass `--author <handle> --source user` so
+     the entry carries that member's provenance (it feeds the existing ACR
+     `source_weight` prior; omitting the flags falls back to the operator handle).
+   - **If power-user**, do nothing extra — this is today's flow, byte-unchanged.
+
+   Team-mode's shared-git setup (attach or init the shared repo) happens in
+   Step 7b once versioning is configured.
+
 ### Step 3 — Interview the user
 
 Keep this concise. Ask one question at a time, or batch 2–3 related questions.
@@ -282,6 +315,47 @@ Then ask once and persist the answer. The setting resolves env → config →
 5. Note the escape hatch: a per-run `AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh …`
    overrides the persisted setting for a single run.
 
+#### Step 7b-1 — Team-mode shared KB (ONLY when `--kb-mode-only` == `team`)
+
+Run this branch ONLY if Step 2 set the workspace mode to **team**
+(`scripts/agentware config --kb-mode-only` prints `team`). In power-user mode,
+SKIP this entirely — the flow above is unchanged.
+
+In team-mode the KB is a **shared git repo** every member clones. Default
+auto-commit **ON** (so each member's learnings sync to the shared remote) and set
+up the shared repo by EITHER attaching an existing one OR initializing a new one.
+
+1. Default auto-commit ON for the team (still ask, but recommend yes):
+   ```bash
+   scripts/agentware config --set-autocommit yes
+   ```
+2. **Attaching an existing shared KB repo?** Before adopting it, VALIDATE that it
+   conforms to the framework layout — a malformed KB would break recall/rebuild
+   for the whole team. Point the operator's clone at it and run:
+   ```bash
+   scripts/agentware attach --path <path-to-cloned-shared-kb>
+   ```
+   - If it prints **ATTACH OK**, adopt it: set the knowledge dir to that path
+     (`scripts/agentware init --knowledge-dir <path>` is idempotent and will not
+     clobber existing entries) and continue.
+   - If it prints **ATTACH REFUSED** for missing structure, offer migration:
+     ```bash
+     scripts/agentware attach --path <path> --migrate
+     ```
+     which idempotently fills missing dirs/rosters (never clobbers data), then
+     re-validates. If it is refused for a corrupted/divergent index, tell the user
+     to run `scripts/agentware index rebuild` in that repo and re-attach.
+3. **Initializing a NEW shared KB repo?** Use the EXISTING git setup from Step 7b
+   item 4 (the `UNTRACKED` branch): `git -C "$KDIR" init`, add the shared remote
+   (`git -C "$KDIR" remote add origin <URL>` — never hardcode URLs; offer
+   `gh repo create` if `gh` is present), and push. Do NOT reimplement auto-commit
+   — it is already wired and now defaults ON.
+4. Explain the shared-remote model: every member clones the same KB repo;
+   auto-commit pushes their knowledge (learnings, index, scorecard, MAIN) after
+   each run; transcripts in `logs/` stay gitignored and local. Per-user provenance
+   (`author`/`source`, set in Step 2) attributes each learning to the member who
+   wrote it, so the ACR trust model stays meaningful with many writers.
+
 #### Step 7b-2 — Retrieval mode (Mode A / Mode B)
 
 agentware retrieves knowledge with one of two modes; ask once and persist the
@@ -375,7 +449,15 @@ resolve.
    Onboarded by: <current agent name, e.g. agentware-execution>
    ```
 3. Verify: `scripts/agentware config` prints `initialized: yes`.
-4. Announce:
+4. **If team-mode** (`scripts/agentware config --kb-mode-only` == `team`), record
+   the onboarding completion event for the dashboard's provenance-mix panel:
+   ```bash
+   scripts/agentware config --record-onboarding
+   ```
+   This appends one `{ts, event:"onboarding", mode:"team", user_handle:"<h>"}`
+   line to `$KDIR/logs/metrics.jsonl` (gitignored — never pushed). Power-user mode
+   skips this.
+5. Announce:
    > "agentware is initialized. Your knowledge base + logs live at `<KDIR>`; the
    > orchestrator package stays read-only. Every session loads your MAIN.md
    > automatically and logs your prompts + transcripts to `<KDIR>/logs/`.
@@ -386,7 +468,7 @@ resolve.
    >
    > To change agentware itself, ask explicitly — I'll warn you first, since that
    > can destabilize the system."
-5. If the user originally asked for a task before onboarding kicked in, resume it.
+6. If the user originally asked for a task before onboarding kicked in, resume it.
 
 ---
 
