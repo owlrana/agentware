@@ -104,8 +104,12 @@ class TeamModeE2E(unittest.TestCase):
         # The per-user handle must live ONLY in config/KB frontmatter, never the
         # package tree. Assert a freshly-set handle does not leak into REPO_ROOT.
         with isolated_home() as mod:
-            _cap(mod, ["config", "--set-user-handle", "zztopsecrethandle"])
-            hits = mod.scan_personal_data(mod.REPO_ROOT, ["zztopsecrethandle"])
+            # Assemble the sentinel at runtime so the literal handle never
+            # appears verbatim in THIS source file — otherwise the package scan
+            # would flag its own fixture line as a false leak.
+            handle = "zz" + "topsecret" + "handle"
+            _cap(mod, ["config", "--set-user-handle", handle])
+            hits = mod.scan_personal_data(mod.REPO_ROOT, [handle])
             self.assertEqual(hits, [], "per-user handle leaked into the package")
 
 
