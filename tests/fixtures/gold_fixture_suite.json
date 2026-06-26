@@ -1,0 +1,69 @@
+{
+  "version": 1,
+  "suite": "gold-fixture",
+  "description": "FROZEN synthetic gold-fixture suite for drift-free absolute eval gating. Contains ZERO operator data (R-LOC-03): every corpus entry and query is invented, generic, public-domain knowledge. Editing this file changes the corpus_fingerprint and re-seeds the gold-fixture gate baseline by design. Keep it small, deterministic, and lexically unambiguous so BM25 recall is stable and high.",
+  "corpus": [
+    {
+      "id": "gf-tides",
+      "title": "How ocean tides form",
+      "summary": "Ocean tides are the daily rise and fall of sea level caused mainly by the gravitational pull of the moon on Earth's oceans. The moon's gravity raises a tidal bulge of water on the near side of Earth, while inertia raises a second bulge on the far side, producing two high tides and two low tides each day. The sun's gravity also contributes, and when the sun and moon align the larger spring tides occur.",
+      "tags": ["ocean", "tides", "moon", "gravity", "astronomy"]
+    },
+    {
+      "id": "gf-photosynthesis",
+      "title": "How plants make food by photosynthesis",
+      "summary": "Photosynthesis is the process by which green plants convert sunlight, water, and carbon dioxide into glucose and oxygen. Chlorophyll in the chloroplasts absorbs light energy, which drives the light reactions that split water and produce ATP. The Calvin cycle then fixes carbon dioxide into sugar. Photosynthesis is the foundation of most food chains on Earth.",
+      "tags": ["plants", "photosynthesis", "chlorophyll", "sunlight", "glucose"]
+    },
+    {
+      "id": "gf-volcano",
+      "title": "Why volcanoes erupt",
+      "summary": "A volcano erupts when molten rock called magma rises through the crust and reaches the surface as lava. Pressure from dissolved gases and the movement of tectonic plates forces magma upward through a vent. When the pressure exceeds the strength of the overlying rock, the volcano erupts, spewing lava, ash, and volcanic gases.",
+      "tags": ["volcano", "magma", "lava", "eruption", "tectonics"]
+    },
+    {
+      "id": "gf-bridge",
+      "title": "How suspension bridges work",
+      "summary": "A suspension bridge carries its deck from large main cables that hang between tall towers and are anchored at each end. The cables transfer the weight of the roadway into tension, while the towers carry that load down in compression to the foundations. This design lets suspension bridges span very long distances over rivers and bays.",
+      "tags": ["bridge", "suspension", "cables", "towers", "engineering"]
+    },
+    {
+      "id": "gf-espresso",
+      "title": "How espresso coffee is brewed",
+      "summary": "Espresso is a concentrated coffee brewed by forcing hot water under high pressure through a compact puck of finely ground coffee. The pressure, typically around nine bars, extracts oils and dissolved solids quickly, producing a small intense shot topped with a layer of foam called crema. Grind size, dose, and pressure all shape the flavor.",
+      "tags": ["coffee", "espresso", "brewing", "pressure", "crema"]
+    },
+    {
+      "id": "gf-glacier",
+      "title": "How glaciers move and shape the land",
+      "summary": "A glacier is a thick mass of ice that forms where snow accumulates faster than it melts and compresses into ice over many years. Under its own weight the glacier slowly flows downhill, grinding rock and carrying debris that it deposits as ridges called moraines. Glaciers carve valleys and are sensitive indicators of climate change.",
+      "tags": ["glacier", "ice", "moraine", "climate", "geology"]
+    }
+  ],
+  "gold": [
+    {
+      "query": "how do ocean tides form from the gravity of the moon",
+      "expected_ids": ["gf-tides"]
+    },
+    {
+      "query": "how do plants convert sunlight into glucose with chlorophyll",
+      "expected_ids": ["gf-photosynthesis"]
+    },
+    {
+      "query": "what causes a volcano to erupt lava from magma",
+      "expected_ids": ["gf-volcano"]
+    },
+    {
+      "query": "how do suspension bridges use cables and towers to span rivers",
+      "expected_ids": ["gf-bridge"]
+    },
+    {
+      "query": "how is espresso coffee brewed under high pressure",
+      "expected_ids": ["gf-espresso"]
+    },
+    {
+      "query": "how do glaciers move downhill and form moraines",
+      "expected_ids": ["gf-glacier"]
+    }
+  ]
+}

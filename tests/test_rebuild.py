@@ -8,7 +8,10 @@ drops deleted entries, and never invents or loses ids. Stdlib unittest only.
 import json
 import os
 
-from _fixtures import SyntheticKBTestCase, load_cli
+try:
+    from tests._fixtures import SyntheticKBTestCase, load_cli
+except ImportError:  # allow `python3 -m unittest tests.test_rebuild`
+    from _fixtures import SyntheticKBTestCase, load_cli
 
 
 class RebuildTests(SyntheticKBTestCase):

@@ -2604,6 +2604,31 @@ def build_corpus(kdir, data):
     return corpus
 
 
+def eval_corpus_fingerprint(corpus):
+    """Deterministic whole-corpus fingerprint (sha256 hex) for gate comparability.
+
+    DISTINCT from the per-document `_corpus_fingerprint` (:492, the vector-cache
+    key): this hashes the ENTIRE corpus actually scored — the ordered set of
+    `(id, doc_text)` pairs — in CANONICAL order (sorted by id) so byte-identical
+    corpora hash identically across runs/machines regardless of index order, while
+    ANY add/remove/edit of a scored entry changes the hash. Pure: no timestamps,
+    no machine state. `corpus` is the `[(entry, doc_text), ...]` list from
+    `build_corpus`. This is the seam that makes `eval --gate` reproducible — two
+    runs only ever compare absolute scores when they scored the same corpus.
+    """
+    import hashlib  # stdlib, lazy
+    pairs = sorted(
+        ((str((e or {}).get("id") or ""), doc or "") for (e, doc) in corpus),
+        key=lambda p: p[0])
+    h = hashlib.sha256()
+    for eid, doc in pairs:
+        h.update(eid.encode("utf-8"))
+        h.update(b"\x00")
+        h.update(doc.encode("utf-8"))
+        h.update(b"\x01")
+    return h.hexdigest()
+
+
 def retrieve_tag(kdir, data, query, top_k=None):
     """Baseline strategy: map a free-text query onto the EXACT-tag `query` path.
 
@@ -3087,6 +3112,7 @@ def evaluate(kdir, data, gold, strategy, top_k, as_of=None):
     the `bm25+acr` strategy decays freshness at a PINNED date (reproducible).
     """
     corpus = build_corpus(kdir, data)
+    corpus_fp = eval_corpus_fingerprint(corpus)
     docs_by_id = {e.get("id"): doc for e, doc in corpus}
     entries_by_id = {e.get("id"): e for e, doc in corpus}
     as_of_for_age = as_of or _today()
@@ -3132,6 +3158,7 @@ def evaluate(kdir, data, gold, strategy, top_k, as_of=None):
         "strategy": strategy,
         "top_k": top_k,
         "num_queries": n,
+        "corpus_fingerprint": corpus_fp,
         "metrics": {
             "recall_at_k": mean(recalls),
             "precision_at_k": mean(precisions),
@@ -3224,6 +3251,16 @@ def evaluate_longmemeval(kdir, dataset_path, strategy, top_k, as_of=None,
     if limit is not None:
         items = items[:limit]
 
+    # Whole-corpus fingerprint over the FROZEN dataset actually scored (the
+    # `(question_id, canonical-question-json)` pairs). LongMemEval is already
+    # drift-free (frozen file), but recording the fingerprint keeps the invariant
+    # that EVERY ledger row carries one, and keeps suites comparable only to runs
+    # over the identical frozen slice.
+    _lme_corpus = [({"id": str(it.get("question_id", i))},
+                    json.dumps(it, sort_keys=True, ensure_ascii=False))
+                   for i, it in enumerate(items) if isinstance(it, dict)]
+    corpus_fp = eval_corpus_fingerprint(_lme_corpus)
+
     recalls, precisions, ndcgs, rrs, latencies = [], [], [], [], []
     per_cat = {}
     abstention = {"count": 0, "by_category": {}}
@@ -3284,6 +3321,7 @@ def evaluate_longmemeval(kdir, dataset_path, strategy, top_k, as_of=None,
         "strategy": strategy,
         "top_k": top_k,
         "num_queries": len(recalls),
+        "corpus_fingerprint": corpus_fp,
         "dataset_path": dataset_path,
         "as_of": as_of,
         "metrics": {
@@ -3298,6 +3336,110 @@ def evaluate_longmemeval(kdir, dataset_path, strategy, top_k, as_of=None,
         "abstention": abstention,
         "determinism_ok": det_ok,
     }
+
+
+# --- Frozen synthetic gold-fixture suite (Task 6) ----------------------------
+# `eval --suite gold-fixture` scores a TINY, VERSIONED, fully SYNTHETIC corpus +
+# queries that ship with the package (tests/fixtures/gold_fixture_suite.json) —
+# NOT operator data (R-LOC-03). Because the corpus is frozen in the repo, its
+# `corpus_fingerprint` is stable, so the absolute-score gate on this suite is
+# DRIFT-FREE by construction: it never false-FAILs on live-KB growth (unlike the
+# own gold set), giving the framework a reproducible regression gate that is
+# independent of any operator knowledge base. It reuses the EXACT same
+# evaluate()/retrieve()/build_corpus() path as the own gold set (entries carry
+# their text inline in `summary`, so there is no file I/O, network, or LLM).
+GOLD_FIXTURE_SUITE = "gold-fixture"
+_GOLD_FIXTURE_REL = os.path.join(
+    "tests", "fixtures", "gold_fixture_suite.json")
+
+
+def gold_fixture_path():
+    """Absolute path to the frozen gold-fixture file shipped with the package."""
+    return os.path.join(REPO_ROOT, _GOLD_FIXTURE_REL)
+
+
+def load_gold_fixture(path):
+    """Load the frozen gold-fixture: returns (entries, gold). Raises ValueError.
+
+    `entries` is the synthetic corpus as index-style dicts (id/title/summary/tags)
+    ready for build_corpus; `gold` is the {query, expected_ids[]} list validated by
+    the shared load_gold rules. The file is package-shipped synthetic data with NO
+    operator content (R-LOC-03). Pure read; deterministic.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        raise ValueError("gold-fixture not found: %s" % path)
+    except json.JSONDecodeError as exc:
+        raise ValueError("invalid JSON in gold-fixture %s: %s" % (path, exc))
+    if not isinstance(doc, dict):
+        raise ValueError("gold-fixture must be a JSON object")
+    corpus = doc.get("corpus")
+    gold_rows = doc.get("gold")
+    if not isinstance(corpus, list) or not corpus:
+        raise ValueError("gold-fixture 'corpus' must be a non-empty list")
+    entries = []
+    seen = set()
+    for i, e in enumerate(corpus):
+        if not isinstance(e, dict):
+            raise ValueError("gold-fixture corpus entry #%d is not an object" % i)
+        eid = e.get("id")
+        if not isinstance(eid, str) or not eid.strip():
+            raise ValueError("gold-fixture corpus entry #%d missing 'id'" % i)
+        if eid in seen:
+            raise ValueError("gold-fixture corpus has duplicate id %r" % eid)
+        seen.add(eid)
+        entries.append({
+            "id": eid,
+            "title": e.get("title") or "",
+            "summary": e.get("summary") or "",
+            "tags": list(e.get("tags") or []),
+        })
+    if not isinstance(gold_rows, list) or not gold_rows:
+        raise ValueError("gold-fixture 'gold' must be a non-empty list")
+    gold = []
+    for i, row in enumerate(gold_rows):
+        if not isinstance(row, dict):
+            raise ValueError("gold-fixture gold entry #%d is not an object" % i)
+        q = row.get("query")
+        exp = row.get("expected_ids")
+        if not isinstance(q, str) or not q.strip():
+            raise ValueError("gold-fixture gold entry #%d missing 'query'" % i)
+        if not isinstance(exp, list) or not exp:
+            raise ValueError(
+                "gold-fixture gold entry #%d missing 'expected_ids'" % i)
+        for x in exp:
+            if str(x) not in seen:
+                raise ValueError(
+                    "gold-fixture gold entry #%d expects unknown id %r" % (i, x))
+        gold.append({"query": q, "expected_ids": [str(x) for x in exp]})
+    return entries, gold
+
+
+def evaluate_gold_fixture(kdir, fixture_path, strategy, top_k, as_of=None):
+    """Score `strategy` over the FROZEN synthetic gold-fixture corpus.
+
+    Reuses evaluate() over a synthetic in-memory index (entries carry their text
+    inline, so no file I/O, network, or LLM), then tags the result as the
+    `gold-fixture` suite. The whole-corpus fingerprint is stable across runs/
+    machines (the corpus is frozen in the repo), so the absolute gate on this
+    suite is DRIFT-FREE. Determinism (INV-1) is asserted by re-scoring and
+    comparing ranked ordering; surfaced as `determinism_ok`. Read-only (INV-2).
+    """
+    entries, gold = load_gold_fixture(fixture_path)
+    synth = {"entries": entries}
+    result = evaluate(kdir, synth, gold, strategy, top_k, as_of=as_of)
+    # Determinism check (INV-1): re-score and compare the ranked ordering of every
+    # query. The fixture is tiny, so a full re-run is cheap. Latency is the only
+    # non-deterministic field and is excluded from the comparison.
+    again = evaluate(kdir, synth, gold, strategy, top_k, as_of=as_of)
+    result["determinism_ok"] = (
+        [q["ranked"] for q in result["per_query"]]
+        == [q["ranked"] for q in again["per_query"]])
+    result["suite"] = GOLD_FIXTURE_SUITE
+    result["as_of"] = as_of
+    return result
 
 
 def record_ledger_suite(kdir, data, result):
@@ -3345,6 +3487,9 @@ def evaluate_ablation(kdir, data, gold, top_k, baseline="tag", treatment="bm25",
         "mode": "ablate",
         "top_k": top_k,
         "num_queries": len(gold),
+        # Both strategies scored the SAME corpus, so either evaluate() result's
+        # fingerprint identifies it (acr-gate rows inherit this for comparability).
+        "corpus_fingerprint": base.get("corpus_fingerprint"),
         "baseline": baseline,
         "treatment": treatment,
         "strategies": {
@@ -3672,6 +3817,46 @@ def compute_reliability(recall_at_k, test_pass_rate, index_ok, determinism_ok):
     return round(100.0 * sum(w * v for w, v in comps) / total_w, 2)
 
 
+def redact_gold_path(gold_path):
+    """Reduce an eval gold-set path to a RELATIVE, PII-free form for the ledger.
+
+    The committed `benchmarks/history.jsonl` is public + reproducible, so a row
+    must NEVER carry an absolute operator HOME path (R-LOC-03). This is the source
+    fix: relativize the gold path against the knowledge dir (its natural root →
+    e.g. "benchmarks/recall-gold.json"), falling back to a HOME-relative form,
+    then to the bare basename. A final guard drops to the basename if any residual
+    operator-identity token survives as a path component. Idempotent: an
+    already-relative path is returned unchanged. Applied in the row BUILDERS (the
+    single persistence choke-point every recorded row of every mode passes
+    through) so the no-leak guarantee is structural, not per-call-site.
+    """
+    if not gold_path or not os.path.isabs(gold_path):
+        return gold_path
+    kdir = resolve_knowledge_dir()
+    bases = []
+    if kdir:
+        bases.append(os.path.abspath(kdir))
+    home = os.path.expanduser("~")
+    if home and home not in ("", "/", "~"):
+        bases.append(home)
+    rel = None
+    for base in bases:
+        try:
+            cand = os.path.relpath(gold_path, base)
+        except ValueError:
+            continue
+        if cand != os.pardir and not cand.startswith(os.pardir + os.sep):
+            rel = cand
+            break
+    if rel is None:
+        rel = os.path.basename(gold_path)
+    for needle in operator_identity_strings(kdir):
+        if needle and needle in rel:
+            rel = os.path.basename(gold_path)
+            break
+    return rel
+
+
 def build_ledger_row(result, git_meta, run_ts, checks):
     """Assemble one immutable ledger row from an eval/ablate result. Pure.
 
@@ -3716,7 +3901,14 @@ def build_ledger_row(result, git_meta, run_ts, checks):
         "strategy": strategy,
         "top_k": result.get("top_k"),
         "num_queries": result.get("num_queries"),
-        "gold_path": result.get("gold_path"),
+        # RELATIVE, PII-free gold path (R-LOC-03): the committed ledger is public,
+        # so never persist an absolute operator HOME path. See redact_gold_path.
+        "gold_path": redact_gold_path(result.get("gold_path")),
+        # Deterministic whole-corpus fingerprint of the scored corpus. Additive
+        # field (append-only preserved); makes gate comparability corpus-aware so
+        # own-gold drift no longer false-FAILs. Legacy rows lack it (treated as a
+        # distinct bucket by gate_baseline).
+        "corpus_fingerprint": result.get("corpus_fingerprint"),
         "metrics": metrics,
         "ablation": ablation,
         "checks": checks,
@@ -3796,7 +3988,13 @@ def build_acr_gate_row(result, decision, git_meta, run_ts, checks):
         "strategy": decided,
         "top_k": result.get("top_k"),
         "num_queries": result.get("num_queries"),
-        "gold_path": result.get("gold_path"),
+        # RELATIVE, PII-free gold path (R-LOC-03) — see redact_gold_path. Covers
+        # the acr-gate row family too, so no recorded row of any mode leaks HOME.
+        "gold_path": redact_gold_path(result.get("gold_path")),
+        # Whole-corpus fingerprint of the scored corpus (inherited from the
+        # ablation result). Keeps acr-gate rows corpus-aware too (Task 3 criterion:
+        # EVERY recorded row carries a fingerprint).
+        "corpus_fingerprint": result.get("corpus_fingerprint"),
         "as_of": result.get("as_of"),
         "metrics": metrics,
         "ablation": {
@@ -3919,20 +4117,35 @@ def _read_ledger(path):
     return rows
 
 
-def gate_baseline(rows, strategy, suite=None):
+def gate_baseline(rows, strategy, suite=None, corpus_fingerprint=None):
     """Best-seen value per gated metric + reliability among COMPARABLE rows.
 
     Comparable = rows recorded with the same retrieval `strategy` AND the same
-    benchmark `suite` (apples to apples: a bm25 run is never gated against a
-    tag-only baseline, and a session-level LongMemEval row is never gated against
-    an own-gold-set row even when both are strategy="bm25"). `suite=None` selects
-    the historical own-gold-set rows (which carry no/None suite). The baseline is
-    the MAX of each metric across all prior comparable rows, so a run can never
-    silently drop below any earlier peak. Returns None when there is no
-    comparable history (first-ever run for this strategy+suite -> seeds + passes).
+    benchmark `suite` AND the same `corpus_fingerprint` (apples to apples: a bm25
+    run is never gated against a tag-only baseline, a session-level LongMemEval
+    row is never gated against an own-gold-set row even when both are
+    strategy="bm25", AND an own-gold run is never gated against a row scored over
+    a DIFFERENT corpus). `suite=None` selects the historical own-gold-set rows
+    (which carry no/None suite).
+
+    The `corpus_fingerprint` filter is what makes own-gold gating REPRODUCIBLE:
+    the live operator KB grows over time, so a row recorded against a smaller
+    corpus has a different fingerprint and is NOT comparable to a run over the
+    grown corpus -> the gate seeds a fresh baseline and PASSES instead of
+    false-failing on corpus drift (byte-identical code). Legacy rows recorded
+    before fingerprinting carry no `corpus_fingerprint` (None) and so form their
+    own distinct bucket -> they never gate a new fingerprinted run. Callers that
+    omit `corpus_fingerprint` (None) match only rows whose fingerprint is also
+    None (legacy semantics preserved).
+
+    The baseline is the MAX of each metric across all prior comparable rows, so a
+    run can never silently drop below any earlier peak. Returns None when there
+    is no comparable history (first-ever run for this strategy+suite+corpus ->
+    seeds + passes).
     """
     comparable = [r for r in rows
-                  if r.get("strategy") == strategy and r.get("suite") == suite]
+                  if r.get("strategy") == strategy and r.get("suite") == suite
+                  and r.get("corpus_fingerprint") == corpus_fingerprint]
     if not comparable:
         return None
     base = {}
@@ -3996,7 +4209,8 @@ def _record_and_gate(args, kdir, data, gold, gold_path, result):
     gate = None
     if want_gate:
         baseline = gate_baseline(prior_rows, recorded["strategy"],
-                                 recorded.get("suite"))
+                                 recorded.get("suite"),
+                                 recorded.get("corpus_fingerprint"))
         passed, regressions = evaluate_gate(
             recorded["metrics"], recorded["reliability"],
             baseline, args.tolerance)
@@ -4015,9 +4229,17 @@ def _record_and_gate(args, kdir, data, gold, gold_path, result):
     return recorded, gate
 
 
-def _gate_exit(gate):
-    """Exit code for a gate result: non-zero (1) only on a real regression."""
-    return 0 if (gate is None or gate["passed"]) else 1
+def _gate_exit(gate, ab=None):
+    """Exit code for a gate result: non-zero (1) only on a real regression.
+
+    When an A/B result is supplied (`eval --gate --ab`), a real A/B FAIL also
+    forces exit 1 — the clean-HEAD vs working-tree comparison is an independent
+    regression signal layered on top of the absolute baseline gate.
+    """
+    code = 0 if (gate is None or gate["passed"]) else 1
+    if ab is not None and not ab["passed"]:
+        code = 1
+    return code
 
 
 def _print_gate(gate):
@@ -4037,6 +4259,139 @@ def _print_gate(gate):
         print("    %-16s best=%.4f  current=%.4f  drop=%.4f" % (
             r["metric"], r["baseline"], r["current"],
             r["baseline"] - r["current"]))
+
+
+# --- Clean-HEAD vs working-tree A/B gate (Task 5) ----------------------------
+# `eval --gate --ab` isolates THIS diff's recall effect from live-KB corpus
+# drift BY CONSTRUCTION: it scores the working-tree CLI and the git-HEAD CLI over
+# the SAME live corpus and PASSES iff working >= head - tolerance. The HEAD CLI
+# is extracted to a temp file via `git show HEAD:scripts/agentware` (read-only —
+# never the work tree or index, INV-2); the temp file is always cleaned up. When
+# git/HEAD is unavailable it cannot prove a regression, so it PASSES with
+# available=False — mirroring gate_baseline's seed-on-empty semantics so the A/B
+# mode can never itself be a hard false-failure. This is exactly the R-PKG-05
+# question ("is THIS diff responsible for the drop?") as a deterministic check.
+
+def _ab_verdict(working, head, tolerance):
+    """Pure A/B decision: (passed, delta). PASS iff working >= head - tolerance."""
+    delta = working - head
+    return (working >= head - tolerance), delta
+
+
+def _extract_head_cli():
+    """Extract HEAD's scripts/agentware to a temp file. Read-only (INV-2).
+
+    Returns (temp_path, head_commit) or (None, None) when git/HEAD/the blob is
+    unavailable. Writes ONLY to a temp file — never the work tree or the index.
+    Caller is responsible for unlinking the returned path.
+    """
+    head_commit = _git_capture(["rev-parse", "--short", "HEAD"])
+    if not head_commit:
+        return None, None
+    blob = _git_capture(["show", "HEAD:scripts/agentware"])
+    if not blob:
+        return None, None
+    import tempfile
+    fd, path = tempfile.mkstemp(prefix="agentware-head-", suffix=".py")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(blob)
+            f.write("\n")
+    except OSError:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+        return None, None
+    return path, head_commit
+
+
+def _ab_head_recall(head_path, kdir, strategy, top_k, as_of, gold_path):
+    """Score the HEAD CLI's plain eval over the SAME corpus; return recall_at_k.
+
+    Runs the extracted HEAD script as a subprocess (a plain read-only eval — NO
+    --record/--gate, so the ledger is untouched), pinning AGENTWARE_KNOWLEDGE_DIR
+    so it scores the IDENTICAL live corpus regardless of the temp file's location.
+    Returns the float recall_at_k, or None if the HEAD run produced none.
+    """
+    env = dict(os.environ)
+    env["AGENTWARE_KNOWLEDGE_DIR"] = kdir
+    argv = [sys.executable, head_path, "eval",
+            "--strategy", strategy, "--top-k", str(top_k),
+            "--as-of", as_of, "--gold", gold_path, "--format", "json"]
+    try:
+        proc = subprocess.run(
+            argv, cwd=REPO_ROOT,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            universal_newlines=True, env=env)
+    except OSError:
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except ValueError:
+        return None
+    recall = (payload.get("metrics") or {}).get("recall_at_k")
+    return recall if isinstance(recall, (int, float)) else None
+
+
+def run_ab_gate(args, kdir, result, gold_path):
+    """Clean-HEAD vs working-tree A/B over the SAME corpus (read-only).
+
+    Attaches `result["ab"]` and returns it. PASS iff working >= head - tolerance.
+    An unavailable HEAD/git (or a HEAD run that yields no recall) PASSES with
+    available=False — it cannot prove this diff caused a regression.
+    """
+    working = (result.get("metrics") or {}).get("recall_at_k")
+    tolerance = args.tolerance
+    strategy = result.get("strategy") or getattr(args, "strategy", "bm25")
+    top_k = result.get("top_k") or args.top_k
+    as_of = result.get("as_of") or _today()
+    head_path, head_commit = _extract_head_cli()
+    if head_path is None:
+        ab = {"available": False, "passed": True,
+              "reason": "git HEAD scripts/agentware unavailable",
+              "working": working, "head": None, "delta": None,
+              "tolerance": tolerance, "head_commit": None, "strategy": strategy}
+        result["ab"] = ab
+        return ab
+    try:
+        head = _ab_head_recall(head_path, kdir, strategy, top_k, as_of, gold_path)
+    finally:
+        try:
+            os.unlink(head_path)
+        except OSError:
+            pass
+    if head is None or working is None:
+        ab = {"available": False, "passed": True,
+              "reason": "HEAD eval produced no recall score",
+              "working": working, "head": head, "delta": None,
+              "tolerance": tolerance, "head_commit": head_commit,
+              "strategy": strategy}
+        result["ab"] = ab
+        return ab
+    passed, delta = _ab_verdict(working, head, tolerance)
+    ab = {"available": True, "passed": passed,
+          "working": working, "head": head, "delta": delta,
+          "tolerance": tolerance, "head_commit": head_commit,
+          "strategy": strategy}
+    result["ab"] = ab
+    return ab
+
+
+def _print_ab(ab):
+    """Human-readable A/B verdict for text format."""
+    if ab is None:
+        return
+    if not ab.get("available", True):
+        print("  ab: PASS (clean-HEAD A/B unavailable: %s)"
+              % ab.get("reason", "n/a"))
+        return
+    print("  ab: %s  working=%.4f  head=%.4f  delta=%+.4f  tol=%.4f  head=%s" % (
+        "PASS" if ab["passed"] else "FAIL",
+        ab["working"], ab["head"], ab["delta"], ab["tolerance"],
+        ab.get("head_commit") or "?"))
 
 
 # --- Scorecard (Phase 3B.3): derived trend VIEW over the ledger --------------
@@ -4137,6 +4492,85 @@ def cmd_bench(args):
     path, n = write_scorecard(kdir)
     print("bench scorecard: wrote %s (%d ledger row%s)" % (
         path, n, "" if n == 1 else "s"))
+    return 0
+
+
+def redact_ledger_gold_paths(ledger_path):
+    """The ONLY sanctioned mutation of the append-only ledger (`:3556` exception):
+    rewrite ONLY the `gold_path` field of each row to its RELATIVE, PII-free form
+    (`redact_gold_path`), preserving every other field value AND row order
+    byte-for-byte.
+
+    Redacting personal data is the documented EXCEPTION to append-only — metric
+    values, reliability, fingerprints and ordering are NEVER touched. A row whose
+    `gold_path` does not change keeps its ORIGINAL bytes verbatim; only a row that
+    actually leaks is re-serialized (sorted keys, matching `append_ledger_row`).
+    Un-parseable / blank lines are passed through untouched. Returns
+    (total_rows, changed_rows). Resolves operator identity via
+    `redact_gold_path` → `operator_identity_strings` (no hardcoded HOME).
+    """
+    if not os.path.isfile(ledger_path):
+        return (0, 0)
+    with open(ledger_path, encoding="utf-8") as f:
+        lines = f.readlines()
+    out = []
+    total = 0
+    changed = 0
+    for raw in lines:
+        stripped = raw.strip()
+        if not stripped:
+            out.append(raw)
+            continue
+        try:
+            row = json.loads(stripped)
+        except ValueError:
+            out.append(raw)  # preserve un-parseable lines verbatim
+            continue
+        total += 1
+        if isinstance(row, dict) and "gold_path" in row:
+            new_gp = redact_gold_path(row.get("gold_path"))
+            if new_gp != row.get("gold_path"):
+                row["gold_path"] = new_gp
+                out.append(
+                    json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")
+                changed += 1
+                continue
+        out.append(raw)  # unchanged row → keep original bytes (append-only intact)
+    with open(ledger_path, "w", encoding="utf-8") as f:
+        f.writelines(out)
+    return (total, changed)
+
+
+def cmd_bench_redact(args):
+    """`bench redact` scrubs operator personal data (R-LOC-03) from the committed
+    benchmark ledger: it rewrites ONLY the leaking `gold_path` field to its
+    relative form, preserving every metric byte-for-byte and row order, then
+    regenerates the derived SCORECARD.md beside the ledger.
+
+    Defaults to the live knowledge dir's `benchmarks/history.jsonl`; pass an
+    explicit ledger PATH (e.g. the repo's committed `benchmarks/history.jsonl`)
+    to scrub that file instead. This is the ONLY sanctioned mutation of the
+    append-only ledger and it may touch ONLY `gold_path`.
+    """
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    ledger = getattr(args, "path", None) or os.path.join(kdir, HISTORY_REL)
+    if not os.path.isfile(ledger):
+        print("bench redact: no ledger at %s (nothing to scrub)" % ledger)
+        return 0
+    total, changed = redact_ledger_gold_paths(ledger)
+    # Regenerate the derived scorecard VIEW beside the scrubbed ledger.
+    scorecard = os.path.join(
+        os.path.dirname(ledger) or ".", os.path.basename(SCORECARD_REL))
+    rows = _read_ledger(ledger)
+    parent = os.path.dirname(scorecard)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+    with open(scorecard, "w", encoding="utf-8") as f:
+        f.write(render_scorecard(rows))
+    print("bench redact: scrubbed %d/%d row gold_path(s) in %s; "
+          "regenerated %s" % (changed, total, ledger, scorecard))
     return 0
 
 
@@ -4277,7 +4711,8 @@ def _run_longmemeval_suite(args, kdir, data):
         }
         if want_gate:
             baseline = gate_baseline(prior_rows, recorded["strategy"],
-                                     recorded.get("suite"))
+                                     recorded.get("suite"),
+                                     recorded.get("corpus_fingerprint"))
             passed, regressions = evaluate_gate(
                 recorded["metrics"], recorded["reliability"], baseline,
                 args.tolerance)
@@ -4327,6 +4762,87 @@ def _run_longmemeval_suite(args, kdir, data):
     return _gate_exit(gate)
 
 
+def _run_gold_fixture_suite(args, kdir, data):
+    """Run `eval --suite gold-fixture`: the frozen synthetic drift-free scorer.
+
+    Scores the requested --strategy over the package-shipped synthetic corpus
+    (NO operator data, R-LOC-03). Because the corpus is frozen its
+    corpus_fingerprint is stable, so the absolute gate on this suite never
+    false-FAILs on live-KB drift. Optionally records/gates an immutable ledger
+    row (suite="gold-fixture"). Read-only w.r.t. the KB except the append-only
+    ledger.
+    """
+    if args.top_k <= 0:
+        sys.stderr.write("agentware: --top-k must be a positive integer\n")
+        return 1
+    as_of = getattr(args, "as_of", None) or _today()
+    if not _is_valid_date(as_of):
+        sys.stderr.write("agentware: --as-of must be a YYYY-MM-DD date\n")
+        return 1
+    fixture_path = getattr(args, "gold", None) or gold_fixture_path()
+    try:
+        result = evaluate_gold_fixture(kdir, fixture_path, args.strategy,
+                                       args.top_k, as_of=as_of)
+    except NotImplementedError as exc:
+        sys.stderr.write("agentware: %s\n" % exc)
+        return 2
+    except ValueError as exc:
+        sys.stderr.write("agentware: %s\n" % exc)
+        return 1
+    result["gold_path"] = fixture_path
+
+    want_gate = getattr(args, "gate", False)
+    recorded, gate = None, None
+    if getattr(args, "record", False) or want_gate:
+        ledger_path = os.path.join(kdir, HISTORY_REL)
+        prior_rows = _read_ledger(ledger_path) if want_gate else None
+        recorded = record_ledger_suite(kdir, data, result)
+        result["recorded"] = {
+            "path": ledger_path, "commit": recorded["commit"],
+            "run": recorded["run"], "reliability": recorded["reliability"],
+        }
+        if want_gate:
+            baseline = gate_baseline(prior_rows, recorded["strategy"],
+                                     recorded.get("suite"),
+                                     recorded.get("corpus_fingerprint"))
+            passed, regressions = evaluate_gate(
+                recorded["metrics"], recorded["reliability"], baseline,
+                args.tolerance)
+            gate = {
+                "passed": passed, "tolerance": args.tolerance,
+                "strategy": recorded["strategy"], "suite": GOLD_FIXTURE_SUITE,
+                "seeded": baseline is None, "baseline": baseline,
+                "regressions": [
+                    {"metric": m, "baseline": b, "current": c}
+                    for m, b, c in regressions],
+            }
+            result["gate"] = gate
+
+    if args.format == "json":
+        json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+        return _gate_exit(gate)
+
+    m = result["metrics"]
+    k = result["top_k"]
+    print("eval --suite gold-fixture: strategy=%s  top_k=%d  queries=%d" % (
+        result["strategy"], k, result["num_queries"]))
+    print("  fixture: %s" % fixture_path)
+    print("  as_of  : %s" % result["as_of"])
+    print("  fingerprint: %s" % result.get("corpus_fingerprint"))
+    print("  Recall@%d     : %.4f" % (k, m["recall_at_k"]))
+    print("  Precision@%d  : %.4f" % (k, m["precision_at_k"]))
+    print("  nDCG@%d       : %.4f" % (k, m["ndcg_at_k"]))
+    print("  MRR           : %.4f" % m["mrr"])
+    print("  determinism   : %s" % ("ok" if result["determinism_ok"] else "FAIL"))
+    if recorded is not None:
+        print("  recorded: %s  commit=%s  reliability=%.2f  run=%s" % (
+            os.path.join(kdir, HISTORY_REL), recorded["commit"],
+            recorded["reliability"], recorded["run"]))
+    _print_gate(gate)
+    return _gate_exit(gate)
+
+
 def cmd_eval(args):
     kdir = require_knowledge_dir()
     if not kdir:
@@ -4338,6 +4854,8 @@ def cmd_eval(args):
 
     if getattr(args, "suite", None) == "longmemeval":
         return _run_longmemeval_suite(args, kdir, data)
+    if getattr(args, "suite", None) == GOLD_FIXTURE_SUITE:
+        return _run_gold_fixture_suite(args, kdir, data)
 
     gold_path = args.gold or os.path.join(kdir, "benchmarks", "recall-gold.json")
     gold, gerr = load_gold(gold_path)
@@ -4417,11 +4935,13 @@ def cmd_eval(args):
     result["gold_path"] = gold_path
     result["as_of"] = as_of
     recorded, gate = _record_and_gate(args, kdir, data, gold, gold_path, result)
+    ab = (run_ab_gate(args, kdir, result, gold_path)
+          if getattr(args, "ab", False) else None)
 
     if args.format == "json":
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
         sys.stdout.write("\n")
-        return _gate_exit(gate)
+        return _gate_exit(gate, ab)
 
     m = result["metrics"]
     k = result["top_k"]
@@ -4440,7 +4960,8 @@ def cmd_eval(args):
             os.path.join(kdir, HISTORY_REL), recorded["commit"],
             recorded["reliability"], recorded["run"]))
     _print_gate(gate)
-    return _gate_exit(gate)
+    _print_ab(ab)
+    return _gate_exit(gate, ab)
 
 
 def cmd_recall(args):
@@ -6736,11 +7257,13 @@ def build_parser():
         "--gold", default=None,
         help="path to gold set JSON (default: <kdir>/benchmarks/recall-gold.json)")
     p_eval.add_argument(
-        "--suite", choices=("longmemeval",), default=None,
-        help="run a public benchmark suite instead of the own gold set. "
+        "--suite", choices=("longmemeval", "gold-fixture"), default=None,
+        help="run a benchmark suite instead of the own gold set. "
              "'longmemeval' scores the requested --strategy on LongMemEval-S at "
              "SESSION granularity (Recall@k headline k=5, per-category, "
-             "abstention reported separately). Strategy-agnostic.")
+             "abstention reported separately). 'gold-fixture' scores a tiny "
+             "FROZEN synthetic corpus shipped with the package (no operator "
+             "data) for a DRIFT-FREE absolute gate. Strategy-agnostic.")
     p_eval.add_argument(
         "--dataset", default=None,
         help="path to the LongMemEval-S JSON for --suite longmemeval (default: "
@@ -6782,6 +7305,14 @@ def build_parser():
                              "ledger row and EXIT NON-ZERO on a regression "
                              "beyond --tolerance (implies --record; seeds + "
                              "passes when there is no prior history)")
+    p_eval.add_argument("--ab", action="store_true",
+                        help="clean-HEAD A/B gate: score the working-tree CLI and "
+                             "the git-HEAD CLI (extracted to a temp file via "
+                             "`git show HEAD:scripts/agentware`, read-only) over "
+                             "the SAME corpus and PASS iff working >= head - "
+                             "tolerance. Isolates THIS diff's recall effect from "
+                             "live-KB corpus drift; emits both numbers + the delta "
+                             "in --format json. Unavailable HEAD ⇒ passes.")
     p_eval.add_argument("--tolerance", type=float, default=0.02,
                         help="max allowed drop per headline metric before --gate "
                              "fails (default: 0.02; reliability uses x100 points)")
@@ -6813,6 +7344,14 @@ def build_parser():
         "scorecard",
         help="regenerate benchmarks/SCORECARD.md trend table from history.jsonl")
     p_score.set_defaults(func=cmd_bench)
+    p_redact = bench_sub.add_parser(
+        "redact",
+        help="scrub operator HOME from ledger gold_path (PII redaction; the ONLY "
+             "sanctioned mutation of the append-only ledger)")
+    p_redact.add_argument(
+        "path", nargs="?", default=None,
+        help="ledger file to scrub (default: <knowledge-dir>/benchmarks/history.jsonl)")
+    p_redact.set_defaults(func=cmd_bench_redact)
 
     # metrics ----------------------------------------------------------------
     p_metrics = sub.add_parser(

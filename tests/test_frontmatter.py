@@ -7,7 +7,10 @@ KB fixtures so nothing touches the operator's real knowledge base.
 import json
 import os
 
-from _fixtures import SyntheticKBTestCase, load_cli
+try:
+    from tests._fixtures import SyntheticKBTestCase, load_cli
+except ImportError:  # allow `python3 -m unittest tests.test_frontmatter`
+    from _fixtures import SyntheticKBTestCase, load_cli
 
 
 class FrontmatterRoundTripTests(SyntheticKBTestCase):

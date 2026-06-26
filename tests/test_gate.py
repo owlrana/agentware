@@ -30,12 +30,20 @@ except ImportError:  # allow `python3 -m unittest tests.test_gate`
 CLI = load_cli()
 
 
-def _row(strategy, recall, reliability, **metric_over):
-    """A minimal ledger row with the fields the gate reads."""
+def _row(strategy, recall, reliability, corpus_fingerprint=None, **metric_over):
+    """A minimal ledger row with the fields the gate reads.
+
+    `corpus_fingerprint`, when given, makes the row comparable (corpus-aware
+    gate, 260626-eval-corpus-pinning): a seeded prior row must carry the SAME
+    fingerprint as the live run's corpus to gate it.
+    """
     metrics = {"recall_at_k": recall, "precision_at_k": 0.2,
                "ndcg_at_k": recall, "mrr": recall}
     metrics.update(metric_over)
-    return {"strategy": strategy, "metrics": metrics, "reliability": reliability}
+    row = {"strategy": strategy, "metrics": metrics, "reliability": reliability}
+    if corpus_fingerprint is not None:
+        row["corpus_fingerprint"] = corpus_fingerprint
+    return row
 
 
 class GateBaselineTest(SyntheticKBTestCase):
@@ -131,6 +139,13 @@ class GateEndToEndTest(SyntheticKBTestCase):
     def _ledger_path(self):
         return os.path.join(self.kdir, "benchmarks", "history.jsonl")
 
+    def _live_fingerprint(self):
+        """The corpus_fingerprint the live own-gold eval will record over this
+        synthetic KB. A seeded prior row must carry it to be comparable under the
+        corpus-aware gate (260626-eval-corpus-pinning)."""
+        return CLI.eval_corpus_fingerprint(
+            CLI.build_corpus(self.kdir, self.index_data))
+
     def _seed_ledger(self, *rows):
         path = self._ledger_path()
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -156,8 +171,10 @@ class GateEndToEndTest(SyntheticKBTestCase):
             self.assertEqual(len(f.read().splitlines()), 1)
 
     def test_prior_better_row_fails_gate(self):
-        # Prior bm25 row with an impossible-to-match recall + reliability.
-        self._seed_ledger(_row("bm25", 0.99, 99.0))
+        # Prior bm25 row with an impossible-to-match recall + reliability,
+        # carrying the live corpus fingerprint so it IS comparable.
+        self._seed_ledger(_row("bm25", 0.99, 99.0,
+                               corpus_fingerprint=self._live_fingerprint()))
         with open(self._ledger_path(), "rb") as f:
             before = f.read()
         # top_k=1 + a query whose top bm25 hit is NOT the expected id => recall 0.
@@ -179,8 +196,9 @@ class GateEndToEndTest(SyntheticKBTestCase):
         self.assertEqual(after.count(b"\n"), 2)
 
     def test_equal_or_better_run_passes(self):
-        # Prior bm25 row with a low bar the current run clears.
-        self._seed_ledger(_row("bm25", 0.0, 0.0))
+        # Prior bm25 row with a low bar the current run clears (same corpus).
+        self._seed_ledger(_row("bm25", 0.0, 0.0,
+                               corpus_fingerprint=self._live_fingerprint()))
         gold = self._write_gold([
             {"query": "geofence reminders never fired arrive",
              "expected_ids": ["learn-geofence-reminders"]},
@@ -194,7 +212,8 @@ class GateEndToEndTest(SyntheticKBTestCase):
         self.assertTrue(payload["gate"]["passed"])
 
     def test_text_format_returns_gate_exit_code(self):
-        self._seed_ledger(_row("bm25", 0.99, 99.0))
+        self._seed_ledger(_row("bm25", 0.99, 99.0,
+                               corpus_fingerprint=self._live_fingerprint()))
         gold = self._write_gold([
             {"query": "python runtime stdlib dependency",
              "expected_ids": ["learn-geofence-reminders"]},
