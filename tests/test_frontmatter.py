@@ -26,12 +26,28 @@ class FrontmatterRoundTripTests(SyntheticKBTestCase):
             "author": "testhandle",
             "source": "agent",
             "last_verified": "2026-06-25",
+            # `relates` is the second inline-list field; non-empty so it emits a
+            # `relates:` line and round-trips like tags (omit-empty is covered by
+            # test_empty_relates_omits_line below).
+            "relates": ["depends-on:learn-other", "relates-to:ref-x"],
         }
         block = mod.render_frontmatter(fields)
         parsed, body = mod.split_frontmatter(block)
         self.assertEqual(body, "")
         for k in mod.FRONTMATTER_FIELDS:
             self.assertEqual(parsed[k], fields[k], "field %s did not round-trip" % k)
+
+    def test_empty_relates_omits_line(self):
+        """A no-edge entry emits NO `relates:` line (backward-compatible:
+        absent == today's byte-identical behavior)."""
+        mod = load_cli()
+        fields = {"id": "x", "title": "X", "category": "references", "tags": [],
+                  "created": "2026-01-01", "summary": "s", "author": "testhandle",
+                  "source": "agent", "last_verified": "2026-01-01", "relates": []}
+        block = mod.render_frontmatter(fields)
+        self.assertNotIn("relates", block)
+        parsed, _ = mod.split_frontmatter(block)
+        self.assertEqual(parsed.get("relates", []), [])
 
     def test_empty_tags_round_trip(self):
         mod = load_cli()
@@ -74,7 +90,12 @@ class FrontmatterDefaultsTests(SyntheticKBTestCase):
         path = os.path.join(self.kdir, "learnings", "widget-quirk.md")
         mod = load_cli()
         fm = mod.read_entry_frontmatter(path)
+        # `relates` is optional (omitted when empty); every other field is always
+        # emitted. A learn writes no edges, so relates defaults to [] (absent).
         for k in mod.FRONTMATTER_FIELDS:
+            if k == "relates":
+                self.assertEqual(fm.get("relates", []), [])
+                continue
             self.assertIn(k, fm, "missing frontmatter field %s" % k)
         self.assertEqual(fm["id"], "learn-widget-quirk")
         self.assertEqual(fm["category"], "learnings")

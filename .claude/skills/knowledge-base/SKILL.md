@@ -124,6 +124,37 @@ scripts/agentware query --tag <tag>        # all entries with a tag
 
 Output is a JSON array of matching entries (empty `[]` on a miss).
 
+## Declared dependency graph (`relates`)
+
+Entries can declare **typed edges** to other entries in an OPTIONAL `relates`
+frontmatter field. Edges are **declared by a human/agent ONLY — never
+LLM-extracted** — so the graph stays deterministic, auditable, and diffable.
+Absent `relates` = today's behavior, byte-identical (it is opt-in).
+
+Each edge is a flat `"<type>:<target-id>"` token in an inline list (the
+restricted-YAML subset has no nested objects, so edges reuse the same inline-list
+machinery as `tags`):
+
+```yaml
+relates: [depends-on:learn-macos-no-timeout, relates-to:ref-bm25-ranking]
+```
+
+Closed vocabulary (`RELATION_TYPES`): `depends-on`, `blocks`, `supersedes`,
+`relates-to`. The graph is a DERIVED artifact — `index rebuild` reconstructs it
+from frontmatter; never hand-edit adjacency. Traverse it (read-only,
+deterministic, cycle-safe; neighbors visited in sorted order):
+
+```bash
+scripts/agentware query --depends-on <id> --depth 0   # forward closure (0 = full)
+scripts/agentware query --impact <id>                 # reverse closure (who breaks)
+scripts/agentware query --relates <id>                # direct neighbors (both ways)
+```
+
+`--depth N` bounds the hops (default `1`; `0` = full transitive closure). Run
+`scripts/agentware audit` to surface the `graph_integrity` check — it flags
+**dangling edges** (a target id not in the index) and **unknown types**, and
+reports **cycles** advisory-only.
+
 ## Validating the index
 
 After any knowledge-base change, run `scripts/agentware index validate` (exit 0
