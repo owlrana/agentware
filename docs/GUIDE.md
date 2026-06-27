@@ -409,24 +409,37 @@ trades zero-install portability for extra paraphrase recall.
 | Network | **None** | **None at query time** — LOCAL model only, no remote API |
 | Best for | Max auditability, portability, determinism | Max accuracy / paraphrase recall |
 
-- **Picking / switching.** Onboarding asks once. To change later:
-  `scripts/agentware config --set-mode deterministic|semantic` (persists to
+- **Picking / switching.** Onboarding asks once. To change later, use the
+  **SETTINGS_AW** aliases: `scripts/agentware config --set-retrieval bm25|semantic`
+  (or the equivalent `--set-mode deterministic|semantic`). It persists to
   `~/.agentware/config.env`; the `AGENTWARE_RETRIEVAL_MODE` env var overrides
-  per-run). Inspect the resolved state with `scripts/agentware config --format json`
+  per-run. Inspect the resolved state with `scripts/agentware config --format json`
   (`retrieval_mode` = what you chose, `effective_retrieval_mode` = what actually
   runs) or the bare `scripts/agentware config --retrieval-mode-only` for shell use.
+  The switch takes effect on the **next** recall/eval (config is read per-run — no
+  daemon, no restart).
 - **The local embedder is pluggable and LAZILY imported.** Mode B reads
   `AGENTWARE_EMBEDDER_BACKEND` — a dotted module (or a path to one) exposing
-  `embed(texts) -> vectors`. A reference backend ships in
-  `scripts/agentware_embedder_ollama.py` (talks to a LOCAL Ollama serving e.g.
-  `nomic-embed-text`). The module is imported **only** when Mode B is active, so
-  Mode A carries **zero** import cost and never depends on anything being installed.
-- **The determinism contract (A unconditional / B model-pinned).** Mode A is
-  byte-identical for all time — same inputs, same bytes, no exceptions. Mode B is
-  reproducible **relative to a pinned model id + the derived vector cache** (keyed by
-  content fingerprint + model id); change the model and you must rebuild the cache.
-  The vector cache is a **derived, regenerable** artifact written **only** by the
-  toolkit — never a hand-edited source of truth.
+  `embed(texts) -> vectors`. Two backends ship: the default real backend
+  `scripts/agentware_embedder_fastembed.py` (pinned **`fastembed==0.8.0`**, ONNX /
+  no PyTorch, default model `BAAI/bge-small-en-v1.5`, opt up to
+  `BAAI/bge-base-en-v1.5`) and a reference `scripts/agentware_embedder_ollama.py`
+  (talks to a LOCAL Ollama serving e.g. `nomic-embed-text`). The module is imported
+  **only** when Mode B is active, so Mode A carries **zero** import cost and never
+  depends on anything being installed.
+- **The determinism contract (A unconditional / B within-machine, honestly stated).**
+  Mode A is byte-identical for all time — same inputs, same bytes, no exceptions.
+  Mode B is deterministic **GIVEN a pinned model id + cached vectors ON A GIVEN
+  MACHINE**: the backend rounds every component to a fixed precision and RRF fuses on
+  **integer ranks**, so residual float jitter can never reorder results, and
+  delete+rebuild yields a byte-identical vector cache file on that machine. We do NOT
+  claim Mode B is unconditionally cross-machine deterministic: ONNX float math can
+  differ across CPUs/architectures, so the vector cache + the recorded benchmark
+  numbers are **reproduced per-machine** (the pinned model id + `VECTOR_CACHE_VERSION`
+  are recorded so a mismatch invalidates the cache rather than silently mixing). The
+  vector cache is a **derived, gitignored, regenerable** artifact written **only** by
+  `index rebuild` (INV-2) — never a hand-edited source of truth; change the model and
+  you must rebuild it.
 - **Honest fallback (Mode B never crashes).** If you configure `semantic` but **no
   local model is reachable**, the effective mode degrades to **Mode A** and a notice
   is printed to **stderr** — `retrieval_mode=semantic requested but no local
@@ -435,6 +448,34 @@ trades zero-install portability for extra paraphrase recall.
   Stdout/JSON stays Mode-A byte-identical, so capture pipelines are unaffected.
 - **No new HARD dependency.** Nothing about Mode B is required to use agentware; it
   is strictly additive and off the Mode-A path.
+
+### SETTINGS_AW — the single, extensible settings layer
+
+All retrieval-strategy choices live in **one** config-backed store —
+`~/.agentware/config.env` — that `recall`/`eval` consult per-run. This is the
+**single source of truth** for the retrieval choice (and the slot for future
+flags). Every key resolves **env → `config.env` → default**:
+
+| Key | Setter | Reader | Default | Meaning |
+|---|---|---|---|---|
+| `AGENTWARE_RETRIEVAL_MODE` | `config --set-retrieval bm25\|semantic` (alias of `--set-mode deterministic\|semantic`) | `config --retrieval-mode-only` (effective) | `deterministic` (Mode A) | Which retrieval mode runs |
+| `AGENTWARE_EMBEDDER_BACKEND` | `config --set-embedder <dotted-name\|path>` | `config --embedder-only` | _unset_ (no semantic backend) | The LOCAL embedder backend module |
+| `AGENTWARE_EMBED_MODEL` | `config --set-embed-model <id>` | `config --embed-model-only` | `nomic-embed-text` | The embedding model id passed to the backend |
+
+- **Resolution order** for every key: the environment variable wins (per-run
+  override), then `~/.agentware/config.env` (the persisted choice), then the
+  documented default. Invalid setter tokens exit non-zero and never corrupt the
+  store. `config --format json` surfaces every key (`retrieval_mode`,
+  `effective_retrieval_mode`, `embedder_backend`, `embed_model`,
+  `semantic_embedder_available`).
+- **Effect timing.** A change takes effect on the **next** recall/eval — config is
+  read per-run; setters reset the lazy embedder cache so a backend/model switch is
+  picked up immediately. No daemon, no restart.
+- **Extensibility contract.** A future feature flag slots into the SAME store via
+  the identical get/set pattern: add a `*_KEY` constant + a strict parse helper, a
+  `--set-<flag>` / `--<flag>-only` pair in `cmd_config` mirroring
+  `_set_config_value`, and surface it in `config --format json`. No new storage, no
+  new file — SETTINGS_AW is the one place settings live.
 
 ### Benchmark methodology & numbers (LongMemEval)
 
