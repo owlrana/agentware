@@ -48,6 +48,8 @@ The loop is table stakes; **trustworthy memory + self-betterment is not.** Every
 
 ✅ yes/strong · ⚠️ partial/caveated · ❌ no/weak. **The honest takeaway:** every harness has a loop, but **none pairs it with deterministic, persistent, non-LLM-managed memory + a regression gate.** Where they lead, we say so: OpenHands has sandboxed code-exec breadth, Cline has deep IDE integration, **Hermes is the closest in spirit** — local-first, persistent, and self-extending — and all of them have vastly more adoption. The line that still separates us from Hermes: its memory is **LLM-curated** (an autonomous Curator grades and prunes it), where ours is **code-managed and benchmark-gated**.
 
+In addition, since this is a framework, it is compatible with EVERY single LLM model, agent or harnesses. So you can use OpenClaw or Hermes with this framework and completely own the memory with all benefits offered here.
+
 ---
 
 ## Capability comparison: agentware vs industry-standard memory layers
@@ -130,10 +132,12 @@ git clone <this-repo> agentware && cd agentware
 # 2. Run your agent runtime (Claude Code) inside the repository — onboarding auto-starts:
 #    it asks where to store your knowledge base, scaffolds it, and personalizes.
 #    make sure you are in the correct path and pay attention during onboarding
-claude "Hello, world!"
+claude "hi"
 
-# 3. Write a short plan, then fire-and-forget the loop:
+# 3. Write a short plan using PLAN_AW, then fire-and-forget the loop:
 ./agentware.sh <YYMMDD-feature>
+
+# or alternatively, execute the plan in interactive mode using command WORK_AW
 ```
 
 Nothing personal is ever committed: the repo is **pure steering**, and your knowledge base lives in an **external directory you choose**. The same clone works for anyone. See the [User Guide](docs/GUIDE.md).
