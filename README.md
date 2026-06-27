@@ -62,11 +62,11 @@ The loop is table stakes; **trustworthy memory + self-betterment is not.** Every
 | Comparable public Recall@5 | ✅ 91.4% | ❌ none | ❌ none | ⚠️ QA-acc | ✅ 95.2% | ⚠️ HotPotQA |
 | Benchmark-gated reliability ledger | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Governed learning → rule loop | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| Semantic / embedding retrieval | ⚠️ roadmap | ✅ | ✅ | ✅ | ✅ | ✅ |
+| Semantic / embedding retrieval | ✅ opt-in (Mode B) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Knowledge graph / multi-hop | ⚠️ roadmap | ✅ | ❌ | ✅ | ✅ opt | ✅ |
 | Maturity / adoption (★, approx) | new | ≈59k | ≈23k | ≈28k | ≈24k | ≈22k |
 
-**Honest gaps:** agentware trails on **raw semantic recall** (paraphrase queries), **knowledge-graph multi-hop**, and **adoption**. Those are deliberate scope choices today — a **local, rank-only** semantic mode (no LLM, no cloud) is on the roadmap; the deterministic stdlib path stays the zero-install default.
+**Honest gaps:** agentware trails on **knowledge-graph multi-hop** and **adoption**. On **raw semantic recall**, a **local, rank-only** semantic mode (no LLM, no cloud) now ships as **opt-in Mode B** (see the measured A/B below) — but on the comparable public benchmark it's a wash at ~111× the latency, so the deterministic BM25 stdlib path stays the zero-install **default**.
 
 ---
 
@@ -127,9 +127,10 @@ The moat in one line:
 # 1. Clone wherever you want your instance to live
 git clone <this-repo> agentware && cd agentware
 
-# 2. Run your agent runtime (Claude Code) inside it — onboarding auto-starts:
+# 2. Run your agent runtime (Claude Code) inside the repository — onboarding auto-starts:
 #    it asks where to store your knowledge base, scaffolds it, and personalizes.
-claude
+#    make sure you are in the correct path and pay attention during onboarding
+claude "Hello, world!"
 
 # 3. Write a short plan, then fire-and-forget the loop:
 ./agentware.sh <YYMMDD-feature>
@@ -154,10 +155,10 @@ Nothing personal is ever committed: the repo is **pure steering**, and your know
 ## How it works
 
 ```
-<knowledge-dir>/work/<YYMMDD-feature>/plan.md     # you write phases + acceptance criteria
+<knowledge-dir>/work/<YYMMDD-feature>/plan.md     # you write phases + acceptance criteria using PLAN_AW
         │
-        ▼   ./agentware.sh <feature>
-   ┌─────────── PRE ───────────┐  sharpen the plan (≤3 tasks), no scope change
+        ▼   ./agentware.sh <feature> to run in LOOP mode with fresh context each iteration or in an interactive mode using WORK_AW
+   ┌─────────── PRE ───────────┐  sharpen the plan, no scope change
    ├─────────── MAIN ──────────┤  execute one task → verify → recall prior knowledge → worklog
    └─────────── POST ──────────┘  self-assess → assessment.md → promote learnings
 ```
