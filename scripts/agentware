@@ -357,13 +357,47 @@ def _parse_retrieval_mode(raw):
 
 
 def _parse_retrieval_mode_strict(raw):
-    """Strict parse for `config --set-mode`: only recognized tokens, else None."""
+    """Strict parse for `config --set-mode`/`--set-retrieval`: recognized tokens only.
+
+    Maps the SETTINGS_AW retrieval alias too: `bm25` -> deterministic (Mode A),
+    `semantic` -> semantic (Mode B), both already in the token sets above.
+    """
     v = (raw or "").strip().strip('"').strip("'").lower()
     if v in _RETRIEVAL_MODE_SEMANTIC_TOKENS:
         return RETRIEVAL_MODE_SEMANTIC
     if v in _RETRIEVAL_MODE_DETERMINISTIC_TOKENS:
         return RETRIEVAL_MODE_DETERMINISTIC
     return None
+
+
+def _parse_embedder_backend_strict(raw):
+    """Strict parse for `config --set-embedder`: a non-empty backend spec.
+
+    SETTINGS_AW (260627-semantic-embedding-settings) writer-side validator. The
+    spec is either a dotted module name (e.g. `agentware_embedder_fastembed`,
+    importable with scripts/ on sys.path) or a filesystem path to a .py backend.
+    We only enforce non-emptiness + single-token-ness here (no whitespace); the
+    actual contract is enforced lazily by `load_embedder` (any bad spec -> None ->
+    graceful Mode-A fallback, never a crash). Returns the cleaned spec or None.
+    """
+    v = (raw or "").strip().strip('"').strip("'")
+    if not v or any(c.isspace() for c in v):
+        return None
+    return v
+
+
+def _parse_embed_model_strict(raw):
+    """Strict parse for `config --set-embed-model`: a non-empty model id.
+
+    SETTINGS_AW writer-side validator. The id is passed verbatim to the backend
+    factory (e.g. the pinned HuggingFace id `BAAI/bge-small-en-v1.5`). We only
+    enforce non-emptiness + no internal whitespace; the backend interprets it.
+    Returns the cleaned id or None.
+    """
+    v = (raw or "").strip().strip('"').strip("'")
+    if not v or any(c.isspace() for c in v):
+        return None
+    return v
 
 
 def resolve_retrieval_mode():
@@ -1424,6 +1458,93 @@ def cmd_config(args):
                 print("Notice: %s" % notice)
         return 0
 
+    # --- SETTINGS_AW (260627-semantic-embedding-settings) -------------------
+    # The single, config-backed, EXTENSIBLE settings layer recall/eval consult to
+    # pick the active retrieval strategy. Each setter mirrors the EXACT
+    # `_set_config_value` + strict-token-parse + echo pattern of `--set-mode`, so a
+    # FUTURE feature flag slots in via the identical get/set pattern (extensibility
+    # contract). All persisted to ~/.agentware/config.env; env still overrides
+    # per-run; the change takes effect on the NEXT recall/eval (config is read
+    # per-run — no daemon, no restart). Schema documented in docs/GUIDE.md.
+
+    # --set-retrieval bm25|semantic: friendly ALIAS for `--set-mode
+    # deterministic|semantic` (writes the SAME RETRIEVAL_MODE_KEY).
+    retrieval_val = getattr(args, "set_retrieval", None)
+    if retrieval_val is not None:
+        norm = _parse_retrieval_mode_strict(retrieval_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-retrieval value %r (use bm25|semantic)\n"
+                % retrieval_val)
+            return 2
+        _set_config_value(RETRIEVAL_MODE_KEY, norm)
+        eff, fell_back, notice = resolve_effective_retrieval_mode()
+        alias = "bm25" if norm == RETRIEVAL_MODE_DETERMINISTIC else "semantic"
+        if as_json:
+            json.dump({"ok": True, "retrieval": alias, "retrieval_mode": norm,
+                       "effective_mode": eff, "fell_back": fell_back,
+                       "notice": notice, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (retrieval %s)"
+                  % (RETRIEVAL_MODE_KEY, norm, HOME_CONFIG, alias))
+            if fell_back:
+                print("Notice: %s" % notice)
+        return 0
+
+    # --set-embedder <dotted-name|path>: persist the LOCAL embedder backend spec.
+    embedder_val = getattr(args, "set_embedder", None)
+    if embedder_val is not None:
+        norm = _parse_embedder_backend_strict(embedder_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-embedder value %r (use a dotted module "
+                "name or a path to a .py backend, no whitespace)\n" % embedder_val)
+            return 2
+        _set_config_value(EMBEDDER_BACKEND_KEY, norm)
+        _reset_embedder_cache()
+        if as_json:
+            json.dump({"ok": True, "embedder_backend": norm,
+                       "semantic_embedder_available": semantic_embedder_available(),
+                       "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (local embedder backend)"
+                  % (EMBEDDER_BACKEND_KEY, norm, HOME_CONFIG))
+        return 0
+
+    # --set-embed-model <hf-id>: persist the embedding model id.
+    embed_model_val = getattr(args, "set_embed_model", None)
+    if embed_model_val is not None:
+        norm = _parse_embed_model_strict(embed_model_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-embed-model value %r (use a non-empty "
+                "model id, no whitespace)\n" % embed_model_val)
+            return 2
+        _set_config_value(EMBED_MODEL_KEY, norm)
+        _reset_embedder_cache()
+        if as_json:
+            json.dump({"ok": True, "embed_model": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (embedding model id)"
+                  % (EMBED_MODEL_KEY, norm, HOME_CONFIG))
+        return 0
+
+    # --embedder-only / --embed-model-only: bare resolved values for shell consumers.
+    if getattr(args, "embedder_only", False):
+        spec = resolve_embedder_backend()
+        if spec:
+            print(spec)
+        return 0
+    if getattr(args, "embed_model_only", False):
+        print(resolve_embed_model())
+        return 0
+
     # --set-kb-mode power|team: persist the WORKSPACE mode (distinct from the
     # retrieval --set-mode above) to ~/.agentware/config.env, then report.
     kb_mode_val = getattr(args, "set_kb_mode", None)
@@ -1540,17 +1661,24 @@ def cmd_config(args):
     if mode_fell_back:
         mode_line += " (effective: %s — no local model)" % eff_mode
     handle_line = "user_handle:   %s" % (user_handle or "<unset>")
+    # SETTINGS_AW surfacing (semantic backend choice): only meaningful in Mode B.
+    embedder_line = "embedder:      %s" % (resolve_embedder_backend() or "<unset>")
+    embed_model_line = "embed_model:   %s" % resolve_embed_model()
     if kdir:
         print("knowledge_dir: %s" % kdir)
         print("initialized:   %s" % ("yes" if initialized else "no"))
         print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
         print(mode_line)
+        print(embedder_line)
+        print(embed_model_line)
         print("kb_mode:       %s" % kb_mode)
         print(handle_line)
         return 0
     print("knowledge_dir: <unconfigured>")
     print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
     print(mode_line)
+    print(embedder_line)
+    print(embed_model_line)
     print("kb_mode:       %s" % kb_mode)
     print(handle_line)
     return 1
@@ -9520,6 +9648,69 @@ def _audit_bm25_cache_check(kdir, data):
     }
 
 
+def _audit_mode_b_health_check(kdir, data):
+    """Mode-B (semantic) health for the dashboard (Rule 7; feature
+    260627-semantic-embedding-settings).
+
+    INERT in deterministic mode (the zero-install default) — it returns a PASS and
+    never false-alarms users who never opted in. When the CONFIGURED retrieval mode
+    is `semantic`, it verifies the two things Mode B needs to actually run:
+      1. a LOCAL embedder is loadable (the optional backend is installed), and
+      2. the derived vector cache is present AND fresh (every live corpus entry has
+         a cached vector whose content fingerprint matches).
+    A missing backend or a missing/stale cache is a clear, ACTIONABLE warning
+    (FAILs the check) so the operator knows semantic is silently falling back to
+    Mode A. Read-only (INV-2): never loads/writes the cache as a side effect beyond
+    a read. Maps to the eval-ledger retrieval metrics (Recall@5/nDCG@5/MRR) — no new
+    hot-path cost.
+    """
+    configured = resolve_retrieval_mode()
+    if configured != RETRIEVAL_MODE_SEMANTIC:
+        return {"name": "mode_b_health", "ok": True,
+                "details": ["inert: retrieval_mode=deterministic (Mode A / BM25, "
+                            "zero-install default) — no semantic backend required"]}
+    problems = []
+    if not semantic_embedder_available():
+        problems.append(
+            "no LOCAL embedder is loadable (set one with `scripts/agentware config "
+            "--set-embedder <backend>` and install it, e.g. "
+            "`python3 -m pip install fastembed==0.8.0`) — semantic is falling back "
+            "to Mode A (BM25)")
+    else:
+        model = resolve_embed_model()
+        cache = load_vector_cache(kdir, model)
+        if cache is None:
+            problems.append(
+                "vector cache for model %r is missing/unreadable — run "
+                "`scripts/agentware index rebuild` to build it (recall still works: "
+                "it falls back to Mode A until the cache exists)" % model)
+        else:
+            cached = cache.get("vectors") or {}
+            stale = []
+            for entry, doc_text in build_corpus(kdir, data):
+                eid = entry.get("id")
+                if eid is None:
+                    continue
+                hit = cached.get(eid)
+                if not (isinstance(hit, dict)
+                        and hit.get("fp") == _corpus_fingerprint(doc_text)):
+                    stale.append(eid)
+            if stale:
+                problems.append(
+                    "vector cache is STALE for %d entr(y/ies) (e.g. %s) — run "
+                    "`scripts/agentware index rebuild` to regenerate (recall stays "
+                    "correct: a stale/missing vector falls back to the BM25 floor)"
+                    % (len(stale), ", ".join(sorted(stale)[:5])))
+    if problems:
+        return {"name": "mode_b_health", "ok": False, "details": problems}
+    model = resolve_embed_model()
+    cache = load_vector_cache(kdir, model) or {}
+    return {"name": "mode_b_health", "ok": True,
+            "details": ["healthy: semantic mode active, embedder loadable, vector "
+                        "cache fresh (model %s, %d entr(y/ies))"
+                        % (model, len(cache.get("vectors") or {}))]}
+
+
 def provenance_coverage(kdir, data):
     """Return (missing_author_ids, total) over indexed entries (READ-ONLY).
 
@@ -9789,6 +9980,7 @@ def cmd_audit(args):
             _audit_steering_lint_check(),
             _audit_personal_data_check(kdir),
             _audit_bm25_cache_check(kdir, data),
+            _audit_mode_b_health_check(kdir, data),
             _audit_graph_integrity_check(kdir, data),
             _audit_provenance_coverage_check(kdir, data),
         ]
@@ -12507,6 +12699,29 @@ def build_parser():
                        help="persist the retrieval mode to ~/.agentware/config.env "
                             "(Mode A deterministic / Mode B semantic; env still "
                             "overrides per-run)")
+    # --- SETTINGS_AW (260627-semantic-embedding-settings) ----------------
+    p_cfg.add_argument("--set-retrieval", dest="set_retrieval",
+                       metavar="bm25|semantic",
+                       help="SETTINGS_AW alias for --set-mode "
+                            "(bm25=Mode A deterministic / semantic=Mode B); "
+                            "persisted to ~/.agentware/config.env")
+    p_cfg.add_argument("--set-embedder", dest="set_embedder",
+                       metavar="DOTTED_NAME|PATH",
+                       help="persist the LOCAL embedder backend spec (dotted module "
+                            "name e.g. agentware_embedder_fastembed, or a path to a "
+                            ".py backend) to ~/.agentware/config.env")
+    p_cfg.add_argument("--embedder-only", action="store_true",
+                       dest="embedder_only",
+                       help="print only the resolved embedder backend spec "
+                            "(empty if unset) for shell consumers")
+    p_cfg.add_argument("--set-embed-model", dest="set_embed_model",
+                       metavar="MODEL_ID",
+                       help="persist the embedding model id (e.g. "
+                            "BAAI/bge-small-en-v1.5) to ~/.agentware/config.env")
+    p_cfg.add_argument("--embed-model-only", action="store_true",
+                       dest="embed_model_only",
+                       help="print only the resolved embedding model id for "
+                            "shell consumers")
     p_cfg.add_argument("--kb-mode-only", action="store_true",
                        dest="kb_mode_only",
                        help="print only the resolved workspace KB mode "

@@ -382,12 +382,34 @@ answer. The setting resolves env → config → **default `deterministic` (Mode 
    ```bash
    scripts/agentware config --retrieval-mode-only   # prints deterministic|semantic
    ```
-3. If they choose **B** but no local embedding model is wired yet, the effective
-   mode **gracefully falls back to `deterministic`** with a notice — it never
-   crashes and never silently misleads. Tell them Mode B activates once a local
-   model is installed (the model setup lands in a later step / docs). They can
-   switch anytime: `scripts/agentware config --set-mode deterministic|semantic`.
-4. Escape hatch: a per-run `AGENTWARE_RETRIEVAL_MODE=semantic ./agentware.sh …`
+3. **If they choose B**, set up the LOCAL semantic backend NOW, fully
+   non-interactively (flags only, no stdin — `R-SHELL-01`). The default backend is
+   `fastembed` (pinned, ONNX, no PyTorch). Run these in order; if ANY step fails,
+   fall back to Mode A with a clear notice (never leave a half-configured semantic
+   mode):
+   ```bash
+   # (a) Install the PINNED optional dependency (operator-approved; R-DEP-02).
+   python3 -m pip install fastembed==0.8.0
+   # (b) Point SETTINGS_AW at the fastembed backend (+ optional model opt-up).
+   scripts/agentware config --set-embedder agentware_embedder_fastembed
+   # scripts/agentware config --set-embed-model BAAI/bge-base-en-v1.5   # optional opt-up
+   # (c) Trigger the one-time model fetch + VERIFY it produces a vector.
+   PYTHONPATH=scripts python3 -c "import agentware_embedder_fastembed as b; v=b.get_embedder().embed(['probe'])[0]; print('embed dim', len(v))"
+   # (d) Build the derived vector cache (sole writer = index rebuild).
+   scripts/agentware index rebuild
+   # (e) Persist the SETTINGS_AW retrieval choice.
+   scripts/agentware config --set-retrieval semantic
+   # Confirm the EFFECTIVE mode actually resolves to semantic:
+   scripts/agentware config --retrieval-mode-only   # should print: semantic
+   ```
+   If `config --retrieval-mode-only` still prints `deterministic`, the model is not
+   available — the effective mode **gracefully falls back** with a notice (it never
+   crashes, never misleads). In that case tell the user Mode A is active and they can
+   retry the steps above anytime. They can switch back to A at any time:
+   `scripts/agentware config --set-retrieval bm25`.
+4. **Mode A is byte-unchanged for non-opt-in users:** if they pick A (the default),
+   change NOTHING about the install — zero dependencies, zero model, zero cache.
+5. Escape hatch: a per-run `AGENTWARE_RETRIEVAL_MODE=semantic ./agentware.sh …`
    overrides the persisted setting for a single run.
 
 #### Step 7c — Install the two workflow aliases (and VERIFY them)
