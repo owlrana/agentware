@@ -112,6 +112,24 @@ EMBEDDER_BACKEND_KEY = "AGENTWARE_EMBEDDER_BACKEND"
 EMBED_MODEL_KEY = "AGENTWARE_EMBED_MODEL"
 EMBED_MODEL_DEFAULT = "nomic-embed-text"
 
+# Dream mode (feature 260627-dream-mode, Phase 1): a scheduled, idle-gated,
+# unattended DETERMINISTIC KB-maintenance cycle that moves all size-scaling
+# maintenance OFF the interactive hot path. Resolution precedence mirrors the
+# other SETTINGS_AW flags: AGENTWARE_DREAM env -> config.env -> default OFF.
+# Dream is OPT-IN: it ships disabled and runs NOTHING until the operator enables
+# it (default '0'). A typo never silently enables it (lenient parse => None =>
+# fall through to the safe OFF default). The resolved value is '1' (on)/'0' (off).
+DREAM_KEY = "AGENTWARE_DREAM"
+DREAM_DEFAULT = "0"
+_DREAM_OFF_TOKENS = ("0", "off", "no", "false", "disable", "disabled")
+_DREAM_ON_TOKENS = ("1", "on", "yes", "true", "enable", "enabled")
+
+# Dream schedule (feature 260627-dream-mode): the nightly run time the scheduler
+# installer (Task 10) wires into launchd/cron. Either a nightly "HH:MM" 24h token
+# or a 5-field cron expression. Default UNSET (None) — no schedule until the
+# operator sets one. Resolution: AGENTWARE_DREAM_SCHEDULE env -> config.env -> None.
+DREAM_SCHEDULE_KEY = "AGENTWARE_DREAM_SCHEDULE"
+
 # Knowledge-dir-relative locations (joined with the resolved knowledge dir).
 INDEX_REL = "index.json"
 LEARNINGS_REL = "learnings"
@@ -459,6 +477,90 @@ def resolve_kb_mode():
     if cfg is not None:
         return cfg
     return KB_MODE_DEFAULT
+
+
+def _parse_dream(raw):
+    """Map a raw dream setting to '1'/'0', or None if empty/unrecognized.
+
+    Lenient (precedence-tier) parse: an unrecognized non-empty value returns None
+    so the caller falls through to the next tier (ultimately the safe OFF
+    default) — a typo never silently ENABLES the unattended cycle.
+    """
+    if raw is None:
+        return None
+    v = raw.strip().strip('"').strip("'").lower()
+    if not v:
+        return None
+    if v in _DREAM_OFF_TOKENS:
+        return "0"
+    if v in _DREAM_ON_TOKENS:
+        return "1"
+    return None
+
+
+def _parse_dream_strict(raw):
+    """Strict parse for `config --set-dream`: only recognized on/off tokens."""
+    v = (raw or "").strip().strip('"').strip("'").lower()
+    if v in _DREAM_OFF_TOKENS:
+        return "0"
+    if v in _DREAM_ON_TOKENS:
+        return "1"
+    return None
+
+
+def resolve_dream():
+    """Resolve the effective dream setting as '1' (on) or '0' (off).
+
+    Precedence: AGENTWARE_DREAM env -> config.env -> default OFF. Read per-run
+    (no daemon); the scheduler/installer + the `dream` command consult this.
+    """
+    env = _parse_dream(os.environ.get(DREAM_KEY))
+    if env is not None:
+        return env
+    cfg = _parse_dream(_read_config_key(DREAM_KEY))
+    if cfg is not None:
+        return cfg
+    return DREAM_DEFAULT
+
+
+def _parse_dream_schedule_strict(raw):
+    """Strict parse/normalize for `config --set-dream-schedule`.
+
+    Accepts either a nightly 24h "HH:MM" token (normalized to zero-padded
+    "HH:MM") or a 5-field cron expression (each field limited to digits and the
+    cron metacharacters `* / , -`). Returns the normalized token, or None for an
+    empty/invalid value (the caller errors out). Deterministic + stdlib-only.
+    """
+    v = (raw or "").strip().strip('"').strip("'")
+    if not v:
+        return None
+    m = re.match(r"^([01]?\d|2[0-3]):([0-5]\d)$", v)
+    if m:
+        return "%02d:%02d" % (int(m.group(1)), int(m.group(2)))
+    fields = v.split()
+    if len(fields) == 5 and all(re.match(r"^[\d*/,\-]+$", f) for f in fields):
+        return " ".join(fields)
+    return None
+
+
+def resolve_dream_schedule():
+    """Resolve the configured dream schedule token, or None if unset.
+
+    Precedence: AGENTWARE_DREAM_SCHEDULE env -> config.env -> None (unset). The
+    value is re-validated through the strict parser so a hand-edited config typo
+    degrades to 'unset' rather than propagating a malformed token to the scheduler.
+    """
+    env = os.environ.get(DREAM_SCHEDULE_KEY)
+    if env is not None and env.strip():
+        norm = _parse_dream_schedule_strict(env)
+        if norm is not None:
+            return norm
+    cfg = _read_config_key(DREAM_SCHEDULE_KEY)
+    if cfg is not None and cfg.strip():
+        norm = _parse_dream_schedule_strict(cfg)
+        if norm is not None:
+            return norm
+    return None
 
 
 def _normalize_user_handle(raw):
@@ -1565,6 +1667,47 @@ def cmd_config(args):
                   % (KB_MODE_KEY, norm, HOME_CONFIG, norm))
         return 0
 
+    # --set-dream on|off: persist the dream-mode opt-in (feature 260627-dream-mode)
+    # to ~/.agentware/config.env, then report. Default OFF; env overrides per-run.
+    dream_val = getattr(args, "set_dream", None)
+    if dream_val is not None:
+        norm = _parse_dream_strict(dream_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-dream value %r (use on|off|1|0|yes|no)\n"
+                % dream_val)
+            return 2
+        _set_config_value(DREAM_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "dream": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (dream mode %s)"
+                  % (DREAM_KEY, norm, HOME_CONFIG,
+                     "ON" if norm == "1" else "OFF"))
+        return 0
+
+    # --set-dream-schedule <HH:MM|cron>: persist the nightly dream schedule token
+    # the installer wires into launchd/cron. Invalid tokens are rejected.
+    dream_sched_val = getattr(args, "set_dream_schedule", None)
+    if dream_sched_val is not None:
+        norm = _parse_dream_schedule_strict(dream_sched_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-dream-schedule value %r (use a nightly "
+                "HH:MM 24h token or a 5-field cron expression)\n" % dream_sched_val)
+            return 2
+        _set_config_value(DREAM_SCHEDULE_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "dream_schedule": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (dream schedule)"
+                  % (DREAM_SCHEDULE_KEY, norm, HOME_CONFIG))
+        return 0
+
     # --set-user-handle <h>: persist the per-user provenance handle. Sanitized to
     # a safe single token; an all-invalid handle is rejected (no config corruption).
     handle_val = getattr(args, "set_user_handle", None)
@@ -1588,6 +1731,19 @@ def cmd_config(args):
     # --kb-mode-only: bare resolved workspace mode for shell consumers (onboarding).
     if getattr(args, "kb_mode_only", False):
         print(resolve_kb_mode())
+        return 0
+
+    # --dream-only: bare resolved dream setting (on/off) for shell consumers
+    # (the scheduler installer + the `dream` idle-gate). Default OFF.
+    if getattr(args, "dream_only", False):
+        print("on" if resolve_dream() == "1" else "off")
+        return 0
+
+    # --dream-schedule-only: bare resolved dream schedule token (empty if unset).
+    if getattr(args, "dream_schedule_only", False):
+        sched = resolve_dream_schedule()
+        if sched:
+            print(sched)
         return 0
 
     # --user-handle-only: bare resolved per-user handle (empty if unset).
@@ -1639,6 +1795,8 @@ def cmd_config(args):
     eff_mode, mode_fell_back, _mode_notice = resolve_effective_retrieval_mode()
     kb_mode = resolve_kb_mode()
     user_handle = resolve_user_handle()
+    dream = resolve_dream()
+    dream_schedule = resolve_dream_schedule()
     initialized = bool(kdir) and os.path.isfile(os.path.join(kdir, SENTINEL_REL))
     if as_json:
         json.dump({"knowledge_dir": kdir, "configured": bool(kdir),
@@ -1646,6 +1804,7 @@ def cmd_config(args):
                    "retrieval_mode": retrieval_mode,
                    "effective_retrieval_mode": eff_mode,
                    "kb_mode": kb_mode, "user_handle": user_handle,
+                   "dream": dream, "dream_schedule": dream_schedule,
                    "embedder_backend": resolve_embedder_backend(),
                    "embed_model": resolve_embed_model(),
                    "semantic_embedder_available": semantic_embedder_available()},
@@ -1661,6 +1820,8 @@ def cmd_config(args):
     if mode_fell_back:
         mode_line += " (effective: %s — no local model)" % eff_mode
     handle_line = "user_handle:   %s" % (user_handle or "<unset>")
+    dream_line = "dream:         %s" % ("on" if dream == "1" else "off")
+    dream_sched_line = "dream_sched:   %s" % (dream_schedule or "<unset>")
     # SETTINGS_AW surfacing (semantic backend choice): only meaningful in Mode B.
     embedder_line = "embedder:      %s" % (resolve_embedder_backend() or "<unset>")
     embed_model_line = "embed_model:   %s" % resolve_embed_model()
@@ -1673,6 +1834,8 @@ def cmd_config(args):
         print(embed_model_line)
         print("kb_mode:       %s" % kb_mode)
         print(handle_line)
+        print(dream_line)
+        print(dream_sched_line)
         return 0
     print("knowledge_dir: <unconfigured>")
     print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
@@ -1681,6 +1844,8 @@ def cmd_config(args):
     print(embed_model_line)
     print("kb_mode:       %s" % kb_mode)
     print(handle_line)
+    print(dream_line)
+    print(dream_sched_line)
     return 1
 
 
@@ -12744,6 +12909,22 @@ def build_parser():
                        dest="record_onboarding",
                        help="append one onboarding event {mode,user_handle} to "
                             "<kdir>/logs/metrics.jsonl (gitignored observability)")
+    # --- dream mode (260627-dream-mode) ----------------------------------
+    p_cfg.add_argument("--dream-only", action="store_true", dest="dream_only",
+                       help="print only the resolved dream setting (on|off) for "
+                            "shell consumers (the scheduler installer + idle-gate)")
+    p_cfg.add_argument("--set-dream", dest="set_dream", metavar="on|off",
+                       help="persist the dream-mode opt-in to "
+                            "~/.agentware/config.env (default OFF; env still "
+                            "overrides per-run)")
+    p_cfg.add_argument("--dream-schedule-only", action="store_true",
+                       dest="dream_schedule_only",
+                       help="print only the resolved dream schedule token "
+                            "(empty if unset) for shell consumers")
+    p_cfg.add_argument("--set-dream-schedule", dest="set_dream_schedule",
+                       metavar="HH:MM|CRON",
+                       help="persist the nightly dream schedule (a 24h HH:MM token "
+                            "or a 5-field cron expression) to ~/.agentware/config.env")
     p_cfg.set_defaults(func=cmd_config)
 
     # attach -----------------------------------------------------------------

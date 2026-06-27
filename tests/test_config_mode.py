@@ -28,7 +28,8 @@ def isolated_config(env=None):
     saved = (mod.HOME_CONFIG, mod.CONFIG_PATHS)
     saved_env = {}
     for k in ("AGENTWARE_KB_MODE", "AGENTWARE_USER_HANDLE",
-              "AGENTWARE_RETRIEVAL_MODE"):
+              "AGENTWARE_RETRIEVAL_MODE", "AGENTWARE_DREAM",
+              "AGENTWARE_DREAM_SCHEDULE"):
         saved_env[k] = os.environ.pop(k, None)
     if env:
         os.environ.update(env)
@@ -140,6 +141,82 @@ class UserHandleTests(unittest.TestCase):
             code, _, err = run(mod, ["config", "--set-user-handle", "!!! @@@"])
             self.assertNotEqual(code, 0)
             self.assertIn("invalid --set-user-handle", err)
+
+
+class DreamModeTests(unittest.TestCase):
+    """Dream-mode opt-in + schedule SETTINGS_AW flags (260627-dream-mode)."""
+
+    def test_default_is_off(self):
+        with isolated_config() as (mod, _cfg):
+            code, out, _ = run(mod, ["config", "--dream-only"])
+            self.assertEqual(code, 0)
+            self.assertEqual(out.strip(), "off")
+
+    def test_set_on_roundtrips(self):
+        with isolated_config() as (mod, cfg):
+            code, _, _ = run(mod, ["config", "--set-dream", "on"])
+            self.assertEqual(code, 0)
+            code, out, _ = run(mod, ["config", "--dream-only"])
+            self.assertEqual(out.strip(), "on")
+            self.assertIn("AGENTWARE_DREAM=1", open(cfg).read())
+
+    def test_set_off_roundtrips(self):
+        with isolated_config() as (mod, _cfg):
+            run(mod, ["config", "--set-dream", "on"])
+            run(mod, ["config", "--set-dream", "off"])
+            code, out, _ = run(mod, ["config", "--dream-only"])
+            self.assertEqual(out.strip(), "off")
+
+    def test_bogus_dream_rejected(self):
+        with isolated_config() as (mod, _cfg):
+            code, _, err = run(mod, ["config", "--set-dream", "maybe"])
+            self.assertNotEqual(code, 0)
+            self.assertIn("invalid --set-dream", err)
+
+    def test_env_overrides_config(self):
+        with isolated_config() as (mod, _cfg):
+            run(mod, ["config", "--set-dream", "off"])
+        with isolated_config(env={"AGENTWARE_DREAM": "on"}) as (mod, _cfg):
+            code, out, _ = run(mod, ["config", "--dream-only"])
+            self.assertEqual(out.strip(), "on")
+
+    def test_schedule_unset_prints_empty(self):
+        with isolated_config() as (mod, _cfg):
+            code, out, _ = run(mod, ["config", "--dream-schedule-only"])
+            self.assertEqual(code, 0)
+            self.assertEqual(out.strip(), "")
+
+    def test_schedule_hhmm_roundtrips_normalized(self):
+        with isolated_config() as (mod, cfg):
+            code, _, _ = run(mod, ["config", "--set-dream-schedule", "3:07"])
+            self.assertEqual(code, 0)
+            code, out, _ = run(mod, ["config", "--dream-schedule-only"])
+            self.assertEqual(out.strip(), "03:07")
+            self.assertIn("AGENTWARE_DREAM_SCHEDULE=03:07", open(cfg).read())
+
+    def test_schedule_cron_roundtrips(self):
+        with isolated_config() as (mod, _cfg):
+            code, _, _ = run(mod, ["config", "--set-dream-schedule", "0 3 * * *"])
+            self.assertEqual(code, 0)
+            code, out, _ = run(mod, ["config", "--dream-schedule-only"])
+            self.assertEqual(out.strip(), "0 3 * * *")
+
+    def test_schedule_bogus_rejected(self):
+        with isolated_config() as (mod, _cfg):
+            for bad in ("25:00", "3pm", "0 3 * *", "nonsense"):
+                code, _, err = run(mod, ["config", "--set-dream-schedule", bad])
+                self.assertNotEqual(code, 0, "should reject %r" % bad)
+                self.assertIn("invalid --set-dream-schedule", err)
+
+    def test_json_surfaces_both_keys(self):
+        import json as _json
+        with isolated_config() as (mod, _cfg):
+            run(mod, ["config", "--set-dream", "on"])
+            run(mod, ["config", "--set-dream-schedule", "02:30"])
+            code, out, _ = run(mod, ["config", "--format", "json"])
+            obj = _json.loads(out)
+            self.assertEqual(obj["dream"], "1")
+            self.assertEqual(obj["dream_schedule"], "02:30")
 
 
 if __name__ == "__main__":
