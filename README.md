@@ -177,7 +177,7 @@ Full walkthrough: [docs/GUIDE.md](docs/GUIDE.md) · plan format: [docs/loop.md](
 
 <a id="local-models"></a>
 
-## 🪶 Small & local models — same framework, weaker models, still ship
+## 🪶 Small & local models — same framework, weaker models, still ship (Experimental)
 
 You don't need a frontier model to get tasks done. agentware's loop — **plan → execute → verify → recall → self-heal** — is exactly the scaffold a *smaller* model needs to punch above its weight: it sharpens the plan before the weak model touches anything, verifies every subtask with your project's own test/health command (so a wrong edit retries instead of shipping), and injects only the relevant, deterministically-retrieved prior knowledge. **The weaker the executor, the more the framework lifts it** — and that's measured below, not asserted.
 
@@ -191,7 +191,7 @@ Every loop phase picks its **own** runtime + model. Resolution is **env → phas
 | `AGENTWARE_{PRE,MAIN,POST}_MODEL` | model id for that phase | e.g. `opus`, `haiku`, `gpt-oss-20b`, `gemma-26b` |
 | `AGENTWARE_{PRE,MAIN,POST}_LOCAL` | local provider (Codex `--oss`) | `lmstudio` \| `ollama` |
 
-### The hybrid profile (recommended) — cloud brains, local hands
+### The hybrid profile (Experimental) — cloud brains, local hands
 
 Keep **planning + assessment on cloud Claude** (you never want a weak model judging its own plan or honesty), and run the high-volume **execute** phase on a **local** model:
 
