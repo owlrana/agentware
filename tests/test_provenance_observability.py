@@ -18,8 +18,22 @@ from tests._fixtures import SyntheticKBTestCase, load_cli
 
 
 class ProvenanceCoverageTests(SyntheticKBTestCase):
+    def setUp(self):
+        super().setUp()
+        # Overwrite the fixture entry files with RAW bodies (no frontmatter) so
+        # the provenance audit correctly reports them as missing `author`. The
+        # shared _fixtures now writes frontmatter, but THESE tests specifically
+        # exercise the "no author" detection path.
+        mod = load_cli()
+        data = self.read_index()
+        for e in data.get("entries", []):
+            path = os.path.join(self.kdir, e["path"])
+            body = mod.strip_frontmatter(open(path, encoding="utf-8").read())
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(body)
+
     def test_reports_missing_author_entries(self):
-        # The synthetic fixture writes raw bodies WITHOUT frontmatter => no author.
+        # Entry files have NO frontmatter => no author detected.
         mod = load_cli()
         data = self.read_index()
         missing, total = mod.provenance_coverage(self.kdir, data)
@@ -27,14 +41,17 @@ class ProvenanceCoverageTests(SyntheticKBTestCase):
         self.assertEqual(sorted(missing), sorted(e["id"] for e in data["entries"]))
 
     def test_check_advisory_in_power_mode(self):
-        # No author anywhere, but power mode (default) => check stays ok (advisory).
+        # No author anywhere, but power mode => check stays ok (advisory).
         mod = load_cli()
-        os.environ.pop("AGENTWARE_KB_MODE", None)
-        data = self.read_index()
-        chk = mod._audit_provenance_coverage_check(self.kdir, data)
-        self.assertEqual(chk["name"], "provenance_coverage")
-        self.assertTrue(chk["ok"])
-        self.assertIn("advisory", " ".join(chk["details"]))
+        os.environ["AGENTWARE_KB_MODE"] = "power"
+        try:
+            data = self.read_index()
+            chk = mod._audit_provenance_coverage_check(self.kdir, data)
+            self.assertEqual(chk["name"], "provenance_coverage")
+            self.assertTrue(chk["ok"])
+            self.assertIn("advisory", " ".join(chk["details"]))
+        finally:
+            os.environ.pop("AGENTWARE_KB_MODE", None)
 
     def test_check_fails_in_team_mode(self):
         mod = load_cli()

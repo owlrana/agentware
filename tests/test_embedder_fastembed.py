@@ -119,6 +119,8 @@ class _BackendTestBase(unittest.TestCase):
 
 # --- ALWAYS-ON: graceful degradation + static-import guards -------------------
 class FastEmbedGracefulDegradeTest(_BackendTestBase):
+    @unittest.skipIf(sys.version_info < (3, 10),
+                     "sys.stdlib_module_names requires Python 3.10+")
     def test_toolkit_static_import_surface_is_stdlib_only(self):
         mods = _imported_top_modules(CLI_PATH)
         stdlib = set(sys.stdlib_module_names) | set(sys.builtin_module_names)

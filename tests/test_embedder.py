@@ -128,6 +128,8 @@ class EmbedderBackendTest(unittest.TestCase):
         self.cli._reset_embedder_cache()
 
     # --- static-import surface stays stdlib-only -----------------------------
+    @unittest.skipIf(sys.version_info < (3, 10),
+                     "sys.stdlib_module_names requires Python 3.10+")
     def test_toolkit_does_not_statically_import_backend_or_network(self):
         mods = _imported_top_modules(CLI_PATH)
         stdlib = set(sys.stdlib_module_names) | set(sys.builtin_module_names)

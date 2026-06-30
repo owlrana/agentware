@@ -98,6 +98,17 @@ def _have(binary):
 class LoopTransitionTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="agentware-trans-")
+        # Patch HOME so that `scripts/agentware init` (called by the loop's
+        # preflight) writes config.env into the TEMP dir, never the operator's
+        # real ~/.agentware/config.env. Without this, running the full test suite
+        # clobbers the real config pointer — the load-bearing isolation fix.
+        self.tmp_home = os.path.join(self.tmp, "home")
+        os.makedirs(self.tmp_home)
+        # Bin dir for the fake CLI: named 'claude' so the per-phase routing
+        # resolution (scripts/agentware config --main-cli-only -> "claude") finds
+        # OUR fake binary on PATH instead of the real one.
+        self.bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin_dir)
         self.kdir = os.path.join(self.tmp, "kb")
         self.docs = os.path.join(self.kdir, "work", FEATURE)
         os.makedirs(self.docs)
@@ -112,20 +123,32 @@ class LoopTransitionTest(unittest.TestCase):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _write_cli(self, body):
-        path = os.path.join(self.tmp, "fake-claude")
+        # Write the fake binary as 'claude' in the temp bin dir so it shadows the
+        # real claude on PATH. The per-phase routing resolves the CLI token "claude"
+        # via `command -v claude` which then finds this fake binary first.
+        path = os.path.join(self.bin_dir, "claude")
         with open(path, "w", encoding="utf-8") as f:
             f.write(body)
         os.chmod(path, os.stat(path).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         return path
 
-    def _env(self, cli, **overrides):
+    def _env(self, cli=None, **overrides):
+        """Build an isolated env dict for the test subprocess.
+
+        The `cli` parameter is accepted for backward compat but ignored — the
+        fake binary is always named 'claude' in self.bin_dir and found via PATH.
+        """
         env = dict(os.environ)
         env.update({
+            "HOME": self.tmp_home,             # isolate config writes from real ~
             "AGENTWARE_KNOWLEDGE_DIR": self.kdir,
-            "AGENTWARE_CLI": cli,
+            "AGENTWARE_CLI": "claude",         # use the token, not the path
             "AGENTWARE_KB_AUTOCOMMIT": "0",
+            "AGENTWARE_KB_PUSH": "0",         # no push attempts in the test
             "AGENTWARE_NO_STREAM": "1",
             "FAKE_PLAN": self.plan,
+            # Prepend our fake bin dir so 'claude' resolves to the fake binary
+            "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),
         })
         env.update(overrides)
         return env
@@ -135,7 +158,7 @@ class LoopTransitionTest(unittest.TestCase):
             ["bash", AGENTWARE_SH, FEATURE, *args],
             cwd=REPO_ROOT, env=env,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, timeout=300,
+            text=True, timeout=60,
         )
 
     def _read_events(self):

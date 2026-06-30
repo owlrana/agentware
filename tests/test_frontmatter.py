@@ -77,9 +77,21 @@ class FrontmatterRoundTripTests(SyntheticKBTestCase):
 class FrontmatterDefaultsTests(SyntheticKBTestCase):
     def setUp(self):
         super().setUp()
+        # Set the user handle so resolve_user_handle() returns 'testhandle'
+        # regardless of the operator's real ~/.agentware/config.env.
+        self._prev_handle = os.environ.get("AGENTWARE_USER_HANDLE")
+        os.environ["AGENTWARE_USER_HANDLE"] = "testhandle"
         # Provide a MAIN.md so the author default resolves to the operator handle.
         with open(os.path.join(self.kdir, "MAIN.md"), "w", encoding="utf-8") as f:
             f.write("# KB\n\n- **Handle**: testhandle\n")
+
+    def tearDown(self):
+        # Restore the real env so other tests are unaffected.
+        if self._prev_handle is None:
+            os.environ.pop("AGENTWARE_USER_HANDLE", None)
+        else:
+            os.environ["AGENTWARE_USER_HANDLE"] = self._prev_handle
+        super().tearDown()
 
     def test_learn_writes_nine_field_frontmatter(self):
         code, out, err = self.run_cli(

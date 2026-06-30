@@ -78,15 +78,17 @@ def _load_cli():
 def _hermetic_env(tmp_home, tmp_kb):
     """Build a subprocess env with a patched HOME + temp AGENTWARE_KNOWLEDGE_DIR.
 
-    Strips any inherited `AGENTWARE_KB_AUTOCOMMIT`/`AGENTWARE_RETRIEVAL_MODE` so
-    the operator's shell settings cannot mask what the temp `config.env` persists
-    (`resolve_kb_autocommit` reads the env var BEFORE config.env). This keeps the
-    autocommit-persistence assertion deterministic.
+    Strips any inherited `AGENTWARE_KB_AUTOCOMMIT`/`AGENTWARE_KB_PUSH`/
+    `AGENTWARE_RETRIEVAL_MODE` so the operator's shell settings cannot mask what
+    the temp `config.env` persists (`resolve_kb_autocommit`/`resolve_kb_push`
+    read the env var BEFORE config.env). This keeps the persistence assertions
+    deterministic.
     """
     env = dict(os.environ)
     env["HOME"] = tmp_home
     env["AGENTWARE_KNOWLEDGE_DIR"] = tmp_kb
     env.pop("AGENTWARE_KB_AUTOCOMMIT", None)
+    env.pop("AGENTWARE_KB_PUSH", None)
     env.pop("AGENTWARE_RETRIEVAL_MODE", None)
     return env
 

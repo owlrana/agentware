@@ -65,6 +65,8 @@ def _imported_top_modules(source_path):
 class StdlibOnlyTest(unittest.TestCase):
     """INV-6 + INV-1: the toolkit imports stdlib modules only and reaches no network."""
 
+    @unittest.skipIf(sys.version_info < (3, 10),
+                     "sys.stdlib_module_names requires Python 3.10+")
     def test_cli_imports_are_stdlib_only(self):
         # sys.stdlib_module_names is the authoritative stdlib set (py3.10+).
         stdlib = set(sys.stdlib_module_names)

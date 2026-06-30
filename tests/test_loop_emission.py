@@ -90,6 +90,17 @@ def _have(binary):
 class LoopEmissionTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.mkdtemp(prefix="agentware-emit-")
+        # Patch HOME so that `scripts/agentware init` (called by the loop's
+        # preflight) writes config.env into the TEMP dir, never the operator's
+        # real ~/.agentware/config.env. Without this, running the full test suite
+        # clobbers the real config pointer — the load-bearing isolation fix.
+        self.tmp_home = os.path.join(self.tmp, "home")
+        os.makedirs(self.tmp_home)
+        # Bin dir for the fake CLI: named 'claude' so the per-phase routing
+        # resolution (scripts/agentware config --main-cli-only -> "claude") finds
+        # OUR fake binary on PATH instead of the real claude binary.
+        self.bin_dir = os.path.join(self.tmp, "bin")
+        os.makedirs(self.bin_dir)
         self.kdir = os.path.join(self.tmp, "kb")
         self.docs = os.path.join(self.kdir, "work", FEATURE)
         os.makedirs(self.docs)
@@ -99,7 +110,8 @@ class LoopEmissionTest(unittest.TestCase):
         # Deliberately do NOT create <kdir>/.initialized: keeping the workspace
         # "uninitialized" makes the pre/post toolkit gates no-op cleanly so the
         # test exercises ONLY the loop + emitter, never the index/KB machinery.
-        self.fake_cli = os.path.join(self.tmp, "fake-claude")
+        # Write the fake binary as 'claude' in bin_dir so it shadows the real one.
+        self.fake_cli = os.path.join(self.bin_dir, "claude")
         with open(self.fake_cli, "w", encoding="utf-8") as f:
             f.write(FAKE_CLI)
         os.chmod(self.fake_cli, os.stat(self.fake_cli).st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -111,11 +123,15 @@ class LoopEmissionTest(unittest.TestCase):
     def _env(self, **overrides):
         env = dict(os.environ)
         env.update({
+            "HOME": self.tmp_home,             # isolate config writes from real ~
             "AGENTWARE_KNOWLEDGE_DIR": self.kdir,
-            "AGENTWARE_CLI": self.fake_cli,
+            "AGENTWARE_CLI": "claude",         # use the token, not a path
             "AGENTWARE_KB_AUTOCOMMIT": "0",   # no git side effects in the test
+            "AGENTWARE_KB_PUSH": "0",         # no push attempts in the test
             "AGENTWARE_NO_STREAM": "1",       # no background tail follower
             "FAKE_PLAN": self.plan,
+            # Prepend bin_dir so 'claude' resolves to our fake binary first
+            "PATH": self.bin_dir + os.pathsep + os.environ.get("PATH", ""),
         })
         env.update(overrides)
         return env

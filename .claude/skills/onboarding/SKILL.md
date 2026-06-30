@@ -450,10 +450,11 @@ If no, skip to 7b. If yes (this concerns the **repo**, not your knowledge dir):
 #### Step 7b — Knowledge-base versioning & auto-commit
 
 This is about the **external knowledge dir** (`$KDIR`), NOT the repo from 7a.
-With versioning on, agentware can auto-commit and push your knowledge (learnings,
-index, scorecard, MAIN) after each run, so you never lose context and can sync it
-across machines. Transcripts in `logs/` are gitignored, so auto-commit only ever
-versions knowledge — never raw session logs.
+With versioning on, agentware can auto-commit your knowledge (learnings, index,
+scorecard, MAIN) after each run, so you never lose context. Push (syncing to the
+remote) is separately controllable — you can commit locally without publishing.
+Transcripts in `logs/` are gitignored, so auto-commit only ever versions
+knowledge — never raw session logs.
 
 **Recommend keeping the KB in git** for versioning, backup, and team sharing.
 Then ask once and persist the answer. The setting resolves env → config →
@@ -465,7 +466,8 @@ Then ask once and persist the answer. The setting resolves env → config →
    KDIR=$(scripts/agentware config --knowledge-dir-only)
    git -C "$KDIR" rev-parse --is-inside-work-tree 2>/dev/null && echo TRACKED || echo UNTRACKED
    ```
-2. Ask: **"Auto-commit & push your knowledge base after each run? [recommended: yes]"**
+2. Ask: **"Auto-commit your knowledge base after each run? [recommended: yes]"**
+   (Note: this controls local commits; pushing is a separate choice below.)
 3. Persist the choice with the toolkit (the ONLY writer of the setting — accepts
    `on|off|yes|no|1|0|true|false`):
    ```bash
@@ -475,7 +477,29 @@ Then ask once and persist the answer. The setting resolves env → config →
    ```bash
    scripts/agentware config --kb-autocommit-only    # prints 1 (on) or 0 (off)
    ```
-4. Handle the KB git state:
+4. **Push-consent follow-up (ONLY when autocommit is enabled):**
+   If the operator enabled auto-commit (step 3 = yes/on), ask a SECOND question:
+   **"Push to remote after each commit, or keep commits local until you push
+   yourself? [recommended: push]"**
+   - **If "push" (or default / enter):** leave push ON (it is ON by default) or
+     explicitly persist it:
+     ```bash
+     scripts/agentware config --set-push on
+     ```
+   - **If "local":** disable push:
+     ```bash
+     scripts/agentware config --set-push off
+     ```
+     Tell the operator: commits will stay local until they manually run
+     `git -C "$KDIR" push`. This is especially relevant for **team-mode shared
+     KBs** — teammates will NOT see your knowledge until you push.
+   - **If autocommit is OFF:** SKIP this question entirely (push is moot when
+     nothing commits).
+   Confirm:
+   ```bash
+   scripts/agentware config --kb-push-only    # prints 1 (on) or 0 (off)
+   ```
+5. Handle the KB git state:
    - **If `UNTRACKED` and the user wants auto-commit**: offer to initialize it.
      With the user's OK, `git -C "$KDIR" init`, then help them add a remote
      (`git -C "$KDIR" remote add origin <URL>` — do NOT hardcode URLs; if `gh`
@@ -486,8 +510,10 @@ Then ask once and persist the answer. The setting resolves env → config →
      `scripts/agentware config --set-autocommit off` and tell them auto-commit is
      **inert** (stored off; also a no-op because the KB isn't tracked). They can
      enable it later with `scripts/agentware config --set-autocommit on`.
-5. Note the escape hatch: a per-run `AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh …`
-   overrides the persisted setting for a single run.
+6. Note the escape hatches:
+   - Per-run commit skip: `AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh …`
+   - Per-run push skip: `AGENTWARE_KB_PUSH=0 ./agentware.sh …`
+   Both override the persisted setting for a single run.
 
 #### Step 7b-1 — Team-mode shared KB (ONLY when `--kb-mode-only` == `team`)
 

@@ -174,30 +174,44 @@ actually a git work tree with an upstream**. A knowledge dir that isn't git-trac
 run is never blocked. So fresh clones whose KB isn't a repo see no behavior change
 until you opt into git; once you do, versioning + backup just happen.
 
-The setting resolves with this precedence:
+Two independent settings control the behavior, each resolving with this precedence:
 
-1. **Per-run env** — `AGENTWARE_KB_AUTOCOMMIT=0|1` set on the command line wins for
-   that one run (the escape hatch).
-2. **Config file** — `AGENTWARE_KB_AUTOCOMMIT=0|1` persisted in
-   `~/.agentware/config.env` (the same file that stores your knowledge dir).
+1. **Per-run env** — `AGENTWARE_KB_AUTOCOMMIT=0|1` / `AGENTWARE_KB_PUSH=0|1` set on
+   the command line wins for that one run (the escape hatch).
+2. **Config file** — the same key persisted in `~/.agentware/config.env` (the same
+   file that stores your knowledge dir).
 3. **Default** — **ON (`1`)** when neither is set.
+
+| `AGENTWARE_KB_AUTOCOMMIT` | `AGENTWARE_KB_PUSH` | Result |
+|---|---|---|
+| `1` (default) | `1` (default) | commit + push — **the default** |
+| `1` | `0` | **commit locally, do NOT push** (teammates won't see until you push yourself) |
+| `0` | (ignored) | neither commit nor push |
 
 Persist a choice (writes the config file without clobbering your knowledge-dir
 setting), and read the resolved value the loop uses:
 
 ```bash
-scripts/agentware config --set-autocommit off   # persist opt-out (or: on|yes)
+scripts/agentware config --set-autocommit off   # persist commit opt-out (or: on|yes)
+scripts/agentware config --set-push off         # persist push opt-out (commits still happen)
 scripts/agentware config --kb-autocommit-only    # prints the resolved 1 / 0
+scripts/agentware config --kb-push-only          # prints the resolved 1 / 0
 ```
 
-Disable it for a single run without changing your saved preference:
+Disable for a single run without changing your saved preference:
 
 ```bash
-AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh <feature>
+AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh <feature>   # no commit, no push
+AGENTWARE_KB_PUSH=0 ./agentware.sh <feature>         # commit locally, skip push
 ```
 
-Onboarding asks once whether to enable auto-commit (recommended: yes) and persists
-your answer here, so most operators never touch these flags by hand.
+Onboarding asks once whether to enable auto-commit (recommended: yes) and, when
+auto-commit is on, a separate push-consent question (recommended: push). Most
+operators never touch these flags by hand.
+
+> **Team-mode implication:** with `AGENTWARE_KB_PUSH=0`, your committed knowledge
+> stays local until you run `git -C "$KDIR" push` yourself. Teammates on the same
+> shared KB will NOT see your latest learnings until that push.
 
 > **`logs/` is never committed or pushed.** Your knowledge dir's `logs/` (full
 > session transcripts) is **gitignored and untracked**, so auto-commit only ever
@@ -239,13 +253,17 @@ scripts/agentware kb-git push        # push, auto-resolving derived-file conflic
    It can never stage your code project or the agentware package — a scope guard
    refuses if the target's work-tree root is the package repo.
 
-3. **Push, resolving derived-file conflicts deterministically.** On a push that the
-   remote rejects because upstream moved, agentware pulls with `--rebase`. If the
-   only conflicts are in **derived files** (`index.json`, the `*/index.md` rosters,
-   `FEATURES.md`), it discards the textual conflict and **rebuilds those files from
-   the entry frontmatter** (`index rebuild`) — *no agent, no hand-merge*. This is
-   why two agents each adding a *different* learning merge cleanly: their entry files
-   live at distinct paths, and the only collision (the index) is regenerated.
+3. **Push (separately gated on `AGENTWARE_KB_PUSH`), resolving derived-file
+   conflicts deterministically.** The push only runs when `AGENTWARE_KB_PUSH` is on
+   (default). When push is off (`AGENTWARE_KB_PUSH=0`), the commit still happens
+   but the push is skipped and the loop logs a line telling you how to push
+   manually (`git -C "$KDIR" push`). On a push that the remote rejects because
+   upstream moved, agentware pulls with `--rebase`. If the only conflicts are in
+   **derived files** (`index.json`, the `*/index.md` rosters, `FEATURES.md`), it
+   discards the textual conflict and **rebuilds those files from the entry
+   frontmatter** (`index rebuild`) — *no agent, no hand-merge*. This is why two
+   agents each adding a *different* learning merge cleanly: their entry files live
+   at distinct paths, and the only collision (the index) is regenerated.
 
 ### The rare case: the same entry edited two ways
 
@@ -488,6 +506,7 @@ flags). Every key resolves **env → `config.env` → default**:
 | `AGENTWARE_DREAM` | `config --set-dream on\|off` | `config --dream-only` | `off` (opt-in) | Enable the unattended `dream` maintenance cycle |
 | `AGENTWARE_DREAM_SCHEDULE` | `config --set-dream-schedule HH:MM\|<cron>` | `config --dream-schedule-only` | _unset_ | Nightly run time the scheduler installs |
 | `AGENTWARE_DREAM_MAX_RUNTIME` | `config --set-dream-max-runtime <N\|Ns\|Nm\|Nh\|off>` | `config --dream-max-runtime-only` | `1800` (30m) | Best-effort wall-clock cap; a cycle that exceeds it stops remaining steps, records a PARTIAL cycle, and exits non-zero (`off`/`0` = disabled) |
+| `AGENTWARE_KB_PUSH` | `config --set-push on\|off` | `config --kb-push-only` | `1` (on) | Gate the push step independently of commit; `0` = commit locally without pushing (team KB: peers don't see until you push) |
 
 - **Resolution order** for every key: the environment variable wins (per-run
   override), then `~/.agentware/config.env` (the persisted choice), then the
@@ -557,7 +576,7 @@ order, each step idempotent and individually skippable:
 | **c** audit `--with-tests` | full health check (incl. unittest + gate) | none (read-only) |
 | **d** eval `--record` | append ONE reliability row, then redact it | one append-only ledger row |
 | **e** detect & report | `audit --stale` + worklog scan → writes an actionable `logs/dream-report-latest.md` | **none** — REPORTS only |
-| **f** kb-git commit | nightly backup (+ optional push), gated on autocommit | one KB commit |
+| **f** kb-git commit | nightly backup (+ optional push), gated on autocommit; push separately gated on `AGENTWARE_KB_PUSH` | one KB commit |
 
 ```bash
 scripts/agentware dream --dry-run            # show the ordered plan; mutate nothing

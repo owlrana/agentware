@@ -743,6 +743,20 @@ kb_autocommit_enabled() {
   [[ "$resolved" != "0" ]]
 }
 
+# kb_push_enabled — independent push gate (feature 260630-kb-push-flag, Task 3).
+# Resolution precedence (per-run env AGENTWARE_KB_PUSH → ~/.agentware/config.env →
+# default ON) lives entirely in `scripts/agentware config --kb-push-only`, which
+# prints 1/0. Returns 0 (enabled) iff the resolved setting != 0, and DEFAULTS TO ON
+# if the CLI can't be read, matching the default-ON contract. Push is independent of
+# commit but only meaningful when autocommit is on — the loop calls this INSIDE the
+# autocommit-enabled branch.
+kb_push_enabled() {
+  [[ ! -x scripts/agentware ]] && return 1
+  local resolved
+  resolved="$(scripts/agentware config --kb-push-only 2>/dev/null || echo 1)"
+  [[ "$resolved" != "0" ]]
+}
+
 run_pre_hooks() {
   if [[ ! -x scripts/agentware ]]; then
     log "[pre-hook] scripts/agentware not found or not executable — skipping toolkit gates."
@@ -921,11 +935,17 @@ run_kb_sync() {
     # no agent (C-1); a same-entry prose conflict pauses for the MERGE_PROMPT; a
     # lossy or invalid merge is REJECTED before it reaches the remote (C-2). A
     # non-tracked / offline KB is a graceful no-op (C-4) — kb_sync_push returns 0.
-    log "[kb-sync] kb_sync_push (push KB upstream — deterministic merge + nothing-lost gate)"
-    if ! kb_sync_push; then
-      echo "Error: [kb-sync] KB push failed — see the message above. Nothing was"
-      echo "pushed (no silent loss); resolve the conflict/race and re-run."
-      exit 1
+    # Push is independently gated on AGENTWARE_KB_PUSH (feature 260630-kb-push-flag,
+    # Task 3) — commit-on/push-off commits locally without publishing.
+    if kb_push_enabled; then
+      log "[kb-sync] kb_sync_push (push KB upstream — deterministic merge + nothing-lost gate)"
+      if ! kb_sync_push; then
+        echo "Error: [kb-sync] KB push failed — see the message above. Nothing was"
+        echo "pushed (no silent loss); resolve the conflict/race and re-run."
+        exit 1
+      fi
+    else
+      log "[kb-sync] KB push disabled (AGENTWARE_KB_PUSH=0) — committed locally, NOT pushed; push yourself with: git -C $kdir push"
     fi
   else
     log "[kb-sync] KB autocommit disabled (resolved AGENTWARE_KB_AUTOCOMMIT=0 — config opt-out or per-run env override) — leaving the KB uncommitted/unpushed."
@@ -1160,7 +1180,15 @@ run_phase() {
 
     local it_t0 it_wall rem
     it_t0=$(date +%s)
-    output=$(run_agent "$phase_name" "$prompt" 2>&1 | tee /dev/tty) || true
+    # tee /dev/tty shows live output while capturing; skip when no TTY is
+    # available (subprocess tests, CI) to avoid blocking the pipeline.
+    # The -t 1 test checks if stdout is connected to a terminal — more reliable
+    # than file-existence checks since /dev/tty can exist but be unopenable.
+    if [[ -t 1 ]] || { : 2>/dev/null >/dev/tty; } 2>/dev/null; then
+      output=$(run_agent "$phase_name" "$prompt" 2>&1 | tee /dev/tty) || true
+    else
+      output=$(run_agent "$phase_name" "$prompt" 2>&1) || true
+    fi
     it_wall=$(( $(date +%s) - it_t0 ))
     rem=$(open_markers)
     # Per-task transition events (Task 7): diff plan.md marker states vs the prior

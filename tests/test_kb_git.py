@@ -83,6 +83,7 @@ class KbGitDetectionTest(unittest.TestCase):
         # Bare remote + a clone whose branch tracks origin/main.
         bare = self._mk("remote.git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk("seed"))
         _run(seed, "remote", "add", "origin", bare)
         _run(seed, "push", "-q", "-u", "origin", "main")
@@ -292,6 +293,7 @@ class KbGitPullTest(unittest.TestCase):
         """A bare remote + a seed pushing main + a clone tracking origin/main."""
         bare = self._mk(name + ".git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk(name + "-seed"))
         _run(seed, "remote", "add", "origin", bare)
         _run(seed, "push", "-q", "-u", "origin", "main")
@@ -434,6 +436,7 @@ class KbGitPushTest(unittest.TestCase):
     def test_clean_fast_forward_push(self):
         bare = self._mk("ff.git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk("ff-seed"), with_commit=False)
         self._build_frontmatter_kb(seed)
         _run(seed, "remote", "add", "origin", bare)
@@ -448,6 +451,7 @@ class KbGitPushTest(unittest.TestCase):
         """Two clones add DIFFERENT learnings; the 2nd push auto-resolves (no agent)."""
         bare = self._mk("conc.git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk("conc-seed"), with_commit=False)
         self._build_frontmatter_kb(seed)
         _run(seed, "remote", "add", "origin", bare)
@@ -486,6 +490,7 @@ class KbGitPushTest(unittest.TestCase):
         """A same-file (entry) conflict is NOT auto-resolved here (Phase 5 territory)."""
         bare = self._mk("prose.git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk("prose-seed"), with_commit=False)
         self._build_frontmatter_kb(seed)
         _run(seed, "remote", "add", "origin", bare)
@@ -577,6 +582,7 @@ class KbGitProseMergeTest(unittest.TestCase):
         """
         bare = self._mk(slug + ".git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk(slug + "-seed"), with_commit=False)
         self._build_frontmatter_kb(seed)
         _run(seed, "remote", "add", "origin", bare)
@@ -642,6 +648,7 @@ class KbGitProseMergeTest(unittest.TestCase):
     def test_merge_continue_no_rebase_in_progress_fails(self):
         bare = self._mk("norebase.git")
         _run(self.tmp, "init", "-q", "--bare", bare)
+        _run(bare, "symbolic-ref", "HEAD", "refs/heads/main")
         seed = _init_repo(self._mk("norebase-seed"), with_commit=False)
         self._build_frontmatter_kb(seed)
         _run(seed, "remote", "add", "origin", bare)

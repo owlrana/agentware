@@ -55,6 +55,15 @@ AUTOCOMMIT_DEFAULT = "1"
 _AUTOCOMMIT_OFF_TOKENS = ("0", "off", "no", "false", "disable", "disabled")
 _AUTOCOMMIT_ON_TOKENS = ("1", "on", "yes", "true", "enable", "enabled")
 
+# KB push setting (feature 260630-kb-push-flag). Independent of autocommit: when
+# autocommit is ON, this flag controls whether committed KB changes are also pushed
+# to the remote. Resolution precedence: AGENTWARE_KB_PUSH env -> config.env ->
+# default ON (byte-identical to today when unset). Push only matters when autocommit
+# is ON (push is gated under commit); when autocommit is OFF, push is moot.
+# Reuses the same _parse_autocommit/_parse_autocommit_strict token parsers.
+PUSH_KEY = "AGENTWARE_KB_PUSH"
+PUSH_DEFAULT = "1"
+
 # Retrieval mode setting (feature 260625-semantic-retrieval-benchmark, Phase 3).
 # Resolution precedence: AGENTWARE_RETRIEVAL_MODE env -> config.env -> default
 # 'deterministic' (Mode A: pure-stdlib BM25 (+ACR), zero-install, byte-identical
@@ -405,6 +414,24 @@ def resolve_kb_autocommit():
     if cfg is not None:
         return cfg
     return AUTOCOMMIT_DEFAULT
+
+
+def resolve_kb_push():
+    """Resolve the effective KB-push setting as '1' (on) or '0' (off).
+
+    Precedence: AGENTWARE_KB_PUSH env var -> config.env -> default ON.
+    This is the SINGLE source of truth read by agentware.sh
+    (`config --kb-push-only`). Push is independent of commit but gated under
+    it — push only matters when autocommit is ON; when autocommit is OFF, push
+    is moot (nothing to push). Reuses the same token parsers as autocommit.
+    """
+    env = _parse_autocommit(os.environ.get(PUSH_KEY))
+    if env is not None:
+        return env
+    cfg = _parse_autocommit(_read_config_key(PUSH_KEY))
+    if cfg is not None:
+        return cfg
+    return PUSH_DEFAULT
 
 
 def _parse_retrieval_mode(raw):
@@ -1776,6 +1803,26 @@ def cmd_config(args):
                      "ON" if norm == "1" else "OFF"))
         return 0
 
+    # --set-push on|off: persist to ~/.agentware/config.env, then report.
+    set_push_val = getattr(args, "set_push", None)
+    if set_push_val is not None:
+        norm = _parse_autocommit_strict(set_push_val)
+        if norm is None:
+            sys.stderr.write(
+                "agentware: invalid --set-push value %r (use on|off|1|0|yes|no)\n"
+                % set_push_val)
+            return 2
+        _set_config_value(PUSH_KEY, norm)
+        if as_json:
+            json.dump({"ok": True, "kb_push": norm, "config": HOME_CONFIG},
+                      sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print("Set %s=%s in %s (KB push %s)"
+                  % (PUSH_KEY, norm, HOME_CONFIG,
+                     "ON" if norm == "1" else "OFF"))
+        return 0
+
     # --set-mode deterministic|semantic: persist to ~/.agentware/config.env, then
     # report (incl. any graceful fallback when semantic has no local model yet).
     mode_val = getattr(args, "set_mode", None)
@@ -2125,8 +2172,14 @@ def cmd_config(args):
         print(resolve_kb_autocommit())
         return 0
 
+    # --kb-push-only: bare resolved setting for shell consumers (the loop).
+    if getattr(args, "kb_push_only", False):
+        print(resolve_kb_push())
+        return 0
+
     kdir = resolve_knowledge_dir()
     autocommit = resolve_kb_autocommit()
+    kb_push = resolve_kb_push()
     retrieval_mode = resolve_retrieval_mode()
     eff_mode, mode_fell_back, _mode_notice = resolve_effective_retrieval_mode()
     kb_mode = resolve_kb_mode()
@@ -2139,7 +2192,7 @@ def cmd_config(args):
     if as_json:
         json.dump({"knowledge_dir": kdir, "configured": bool(kdir),
                    "initialized": initialized, "kb_autocommit": autocommit,
-                   "retrieval_mode": retrieval_mode,
+                   "kb_push": kb_push, "retrieval_mode": retrieval_mode,
                    "effective_retrieval_mode": eff_mode,
                    "kb_mode": kb_mode, "cli": cli, "user_handle": user_handle,
                    "dream": dream, "dream_schedule": dream_schedule,
@@ -2177,6 +2230,7 @@ def cmd_config(args):
         print("knowledge_dir: %s" % kdir)
         print("initialized:   %s" % ("yes" if initialized else "no"))
         print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
+        print("kb_push:       %s" % ("on" if kb_push == "1" else "off"))
         print(mode_line)
         print(embedder_line)
         print(embed_model_line)
@@ -2189,6 +2243,7 @@ def cmd_config(args):
         return 0
     print("knowledge_dir: <unconfigured>")
     print("kb_autocommit: %s" % ("on" if autocommit == "1" else "off"))
+    print("kb_push:       %s" % ("on" if kb_push == "1" else "off"))
     print(mode_line)
     print(embedder_line)
     print(embed_model_line)
@@ -13800,6 +13855,7 @@ def _dream_health_gate_checks(kdir):
         ("AGENTWARE_KB_MODE", "KB mode", "power"),
         ("AGENTWARE_CLI", "runtime CLI", "claude"),
         ("AGENTWARE_KB_AUTOCOMMIT", "KB autocommit", "1"),
+        ("AGENTWARE_KB_PUSH", "KB push", "1"),
         ("AGENTWARE_RETRIEVAL_MODE", "retrieval mode", "deterministic"),
     ]
     for key, label, default in required_keys:
@@ -14182,8 +14238,9 @@ def _dream_step_detect_report(kdir, dry_run):
 
 def _dream_step_kb_git(kdir, dry_run):
     """Step f — nightly backup: kb-git commit (+ optional push), gated on
-    autocommit. A non-tracked KB / autocommit OFF / no upstream degrades to a
-    clean no-op. NEVER stages the package repo (the helper refuses, C-3)."""
+    autocommit; push is separately gated on AGENTWARE_KB_PUSH (default ON).
+    A non-tracked KB / autocommit OFF / no upstream degrades to a clean no-op.
+    NEVER stages the package repo (the helper refuses, C-3)."""
     # Dry-run is a PURE plan: report the intended step uniformly with every other
     # step and probe NO environment-specific state (autocommit / git work tree),
     # so `dream --dry-run` is byte-stable regardless of the host KB's git status.
@@ -14206,10 +14263,14 @@ def _dream_step_kb_git(kdir, dry_run):
     result = {"status": "ok" if rc == 0 else "fail", "committed": committed,
               "sha": sha1[:9] if committed else "-"}
     if committed and git_has_upstream(kdir):
-        push_ns = argparse.Namespace(path=None, on_prose_conflict="abort",
-                                     max_retries=3, format="text")
-        prc, _ = _dream_capture(cmd_kb_git_push, push_ns)
-        result["pushed"] = prc == 0
+        if resolve_kb_push() == "1":
+            push_ns = argparse.Namespace(path=None, on_prose_conflict="abort",
+                                         max_retries=3, format="text")
+            prc, _ = _dream_capture(cmd_kb_git_push, push_ns)
+            result["pushed"] = prc == 0
+        else:
+            result["pushed"] = False
+            result["push_skipped"] = "AGENTWARE_KB_PUSH=0"
     else:
         result["pushed"] = False
     return result
@@ -15447,6 +15508,13 @@ def build_parser():
     p_cfg.add_argument("--set-autocommit", dest="set_autocommit",
                        metavar="on|off",
                        help="persist the KB-autocommit setting to "
+                            "~/.agentware/config.env (env still overrides per-run)")
+    p_cfg.add_argument("--kb-push-only", action="store_true",
+                       dest="kb_push_only",
+                       help="print only the resolved KB-push setting (1/0)")
+    p_cfg.add_argument("--set-push", dest="set_push",
+                       metavar="on|off",
+                       help="persist the KB-push setting to "
                             "~/.agentware/config.env (env still overrides per-run)")
     p_cfg.add_argument("--retrieval-mode-only", action="store_true",
                        dest="retrieval_mode_only",

@@ -198,7 +198,8 @@ class _GuardedEnv:
     everything afterward."""
 
     _KEYS = ("AGENTWARE_NESTED_UNITTEST", "AGENTWARE_DREAM",
-             "AGENTWARE_DREAM_SCHEDULE", "HOME", "AGENTWARE_KB_AUTOCOMMIT")
+             "AGENTWARE_DREAM_SCHEDULE", "HOME", "AGENTWARE_KB_AUTOCOMMIT",
+             "AGENTWARE_KB_MODE", "AGENTWARE_USER_HANDLE")
 
     def _save_env(self):
         self._env = {k: os.environ.get(k) for k in self._KEYS}
@@ -212,6 +213,24 @@ class _GuardedEnv:
         self._saved_cfg = (self._mod.HOME_CONFIG, self._mod.CONFIG_PATHS)
         self._mod.HOME_CONFIG = cfg
         self._mod.CONFIG_PATHS = (cfg,)
+
+    def _satisfy_health_gate(self, kdir):
+        """Write minimal state so dream step 2 (health-gate) reports 'ok'.
+
+        The health-gate checks for .initialized, MAIN.md, and
+        AGENTWARE_KNOWLEDGE_DIR in config. Without these the step returns
+        'warn'/'degraded' → exit 1 even though the steps under test are fine.
+        """
+        sentinel = os.path.join(kdir, ".initialized")
+        if not os.path.exists(sentinel):
+            with open(sentinel, "w") as f:
+                f.write("2026-01-01T00:00:00Z testuser\nHandle: testuser\n")
+        main = os.path.join(kdir, "MAIN.md")
+        if not os.path.exists(main):
+            with open(main, "w") as f:
+                f.write("# Test KB\n")
+        with open(self._mod.HOME_CONFIG, "a") as f:
+            f.write("AGENTWARE_KNOWLEDGE_DIR=%s\n" % kdir)
 
     def _restore_env(self):
         self._mod.HOME_CONFIG, self._mod.CONFIG_PATHS = self._saved_cfg
@@ -237,6 +256,7 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         run_cli(["index", "migrate-frontmatter"], self.kdir)
         _seed_gold(self.kdir)
         _migrate_kb(self.kdir)
+        self._satisfy_health_gate(self.kdir)
 
     def _run(self, argv):
         return run_cli(["dream"] + argv, self.kdir)
@@ -250,7 +270,7 @@ class DreamCycleTests(unittest.TestCase, _GuardedEnv):
         payload = json.loads(out)
         self.assertTrue(payload["dry_run"])
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["a", "b", "c", "d", "e", "f"])
+                         ["0", "1", "2", "a", "b", "c", "d", "e", "f"])
         for s in payload["steps"]:
             self.assertEqual(s["status"], "planned")
 
@@ -412,11 +432,12 @@ class DreamGitSyncTests(unittest.TestCase, _GuardedEnv):
         run_cli(["index", "migrate-frontmatter"], self.kdir)
         _seed_gold(self.kdir)
         _migrate_kb(self.kdir)
+        self._satisfy_health_gate(self.kdir)
         for k, v in {"GIT_AUTHOR_NAME": "t", "GIT_AUTHOR_EMAIL": "t@e",
                      "GIT_COMMITTER_NAME": "t", "GIT_COMMITTER_EMAIL": "t@e"}.items():
             os.environ[k] = v
             self.addCleanup(os.environ.pop, k, None)
-        for argv in (["init", "-q"], ["add", "-A"],
+        for argv in (["init", "-q", "-b", "main"], ["add", "-A"],
                      ["commit", "-q", "-m", "chore(kb): seed"]):
             subprocess.run(["git", "-C", self.kdir] + argv,
                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, check=True)
@@ -1127,6 +1148,7 @@ class DreamObservabilityE2ETests(unittest.TestCase, _GuardedEnv):
             f.write("# Worklog — 260628-e2e\n\n"
                     "> LEARNED: e2e dream observability proof marker alpha\n"
                     "> DECISION: e2e injected a failing audit step for determinism\n")
+        self._satisfy_health_gate(self.kdir)
         os.environ["AGENTWARE_DREAM"] = "1"  # ON so dream_health is live (not inert)
 
     def test_full_cycle_is_self_explaining_from_disk(self):
@@ -1159,7 +1181,7 @@ class DreamObservabilityE2ETests(unittest.TestCase, _GuardedEnv):
         steps = {s["step"]: s for s in payload["steps"]}
         # The full a-f cycle ran (c failed but never aborted the rest).
         self.assertEqual([s["step"] for s in payload["steps"]],
-                         ["a", "b", "c", "d", "e", "f"])
+                         ["0", "1", "2", "a", "b", "c", "d", "e", "f"])
         self.assertEqual(steps["c"]["status"], "fail")
         self.assertEqual(steps["e"]["status"], "ok")
 

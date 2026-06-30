@@ -79,6 +79,7 @@ _ENTRIES = [
         "path": "learnings/geofence-reminders.md",
         "tags": ["geofence", "ios", "reminders", "expo"],
         "created": "2026-01-02",
+        "author": "testuser",
         "summary": "Why arrival geofence reminders never fired and the fixes.",
         "body": (
             "# Geofence Reminders Not Firing\n\n"
@@ -96,6 +97,7 @@ _ENTRIES = [
         "path": "learnings/macos-no-timeout.md",
         "tags": ["macos", "shell", "timeout"],
         "created": "2026-01-03",
+        "author": "testuser",
         "summary": "macOS has no timeout/gtimeout; do not rely on it in scripts.",
         "body": (
             "# macOS Ships No Timeout Command\n\n"
@@ -112,6 +114,7 @@ _ENTRIES = [
         "path": "configurations/python-runtime.md",
         "tags": ["python", "runtime", "stdlib"],
         "created": "2026-01-04",
+        "author": "testuser",
         "summary": "Pure python3 stdlib only; pin dependency versions.",
         "body": (
             "# Python Runtime Conventions\n\n"
@@ -127,6 +130,7 @@ _ENTRIES = [
         "path": "references/bm25-ranking.md",
         "tags": ["retrieval", "ranking", "bm25", "search"],
         "created": "2026-01-05",
+        "author": "testuser",
         "summary": "Hand-rolled BM25 lexical ranking for deterministic recall.",
         "body": (
             "# BM25 Deterministic Ranking\n\n"
@@ -171,6 +175,22 @@ def build_synthetic_kb(root, entries=None):
         abs = os.path.join(root, e["path"])
         os.makedirs(os.path.dirname(abs), exist_ok=True)
         with open(abs, "w", encoding="utf-8") as f:
+            # Write YAML frontmatter so the provenance audit (which reads from
+            # files, not index.json) finds the `author` field in team mode.
+            fm_fields = ["id", "title", "category", "tags", "created",
+                         "author", "summary"]
+            fm_lines = ["---"]
+            for k in fm_fields:
+                v = e.get(k)
+                if v is None:
+                    continue
+                if isinstance(v, list):
+                    fm_lines.append("%s: [%s]" % (k, ", ".join(v)))
+                else:
+                    fm_lines.append("%s: %s" % (k, v))
+            fm_lines.append("---")
+            fm_lines.append("")
+            f.write("\n".join(fm_lines))
             f.write(e["body"])
     data = _index_from(entries)
     with open(os.path.join(root, "index.json"), "w", encoding="utf-8") as f:

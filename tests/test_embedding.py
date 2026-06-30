@@ -309,6 +309,8 @@ class HybridEmbedTest(unittest.TestCase):
         self.assertEqual(self.cli._cosine([], [1.0]), 0.0)
 
     # --- 6. the moat: static-import surface stays stdlib-only ----------------
+    @unittest.skipIf(sys.version_info < (3, 10),
+                     "sys.stdlib_module_names requires Python 3.10+")
     def test_static_import_surface_stays_stdlib_only(self):
         mods = _imported_top_modules(CLI_PATH)
         stdlib = set(sys.stdlib_module_names) | set(sys.builtin_module_names)

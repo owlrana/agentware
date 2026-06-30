@@ -231,14 +231,25 @@ The orchestrator package stays read-only across projects.
 ## Git-syncing the knowledge base (on by default)
 
 If you keep your knowledge dir in its own git repo, the loop syncs it
-automatically. It is **ON by default** and resolves env → config → default-ON:
-the per-run env var `AGENTWARE_KB_AUTOCOMMIT=0|1` wins, then a persisted choice in
-`~/.agentware/config.env`, then the default `1`. It only ever **acts** when the KB
-is a git work tree with an upstream — a non-tracked / offline KB is a clean no-op.
+automatically. Two independent settings control the behavior:
+
+- **`AGENTWARE_KB_AUTOCOMMIT`** — gates the commit (and by implication the push).
+- **`AGENTWARE_KB_PUSH`** — gates the push independently of the commit.
+
+Both resolve env → config → default-ON, and both only ever **act** when the KB is
+a git work tree with an upstream — a non-tracked / offline KB is a clean no-op.
+
+| `AGENTWARE_KB_AUTOCOMMIT` | `AGENTWARE_KB_PUSH` | Result |
+|---|---|---|
+| `1` (default) | `1` (default) | commit + push — **the default, byte-identical to previous behavior** |
+| `1` | `0` | **commit locally, do NOT push** (new — teammates won't see until you push yourself) |
+| `0` | (ignored) | neither commit nor push — unchanged |
 
 ```bash
-scripts/agentware config --set-autocommit off   # persist an opt-out (or on|yes)
-AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh <feature>   # disable for one run
+scripts/agentware config --set-autocommit off   # persist commit opt-out (or on|yes)
+scripts/agentware config --set-push off         # persist push opt-out (commit still happens)
+AGENTWARE_KB_AUTOCOMMIT=0 ./agentware.sh <feature>   # disable commit+push for one run
+AGENTWARE_KB_PUSH=0 ./agentware.sh <feature>         # commit locally but skip push for one run
 ```
 
 `logs/` (session transcripts) and `.loop/` (ephemeral per-feature loop state —
@@ -250,14 +261,16 @@ the agentware package):
 
 - **Pre-phase** fast-forwards the KB from upstream at a safe point (clean tree with
   an upstream). Dirty/offline/no-upstream → a graceful skip that never blocks the run.
-- **After the post-phase** (not before it), the commit+push runs as a separate
-  `run_kb_sync` step so the assessment the post-phase just wrote — `assessment.md`
-  plus its `benchmarks/history.jsonl` + `SCORECARD.md` ledger rows — is captured in
-  the SAME commit as the main work, leaving no uncommitted tail. It runs on BOTH the
-  post-ran and `--skip-post` paths. Only after the zero-knowledge-loss gate passes
-  (every `> LEARNED:` promoted, index valid — re-checked here in case the post-phase
-  added a marker) does it stage only files under the knowledge dir into **one**
-  `feat|chore(<tag>): <message>` commit, then push. The `<message>` is derived
+- **After the post-phase** (not before it), the commit (and optionally push) runs
+  as a separate `run_kb_sync` step so the assessment the post-phase just wrote —
+  `assessment.md` plus its `benchmarks/history.jsonl` + `SCORECARD.md` ledger rows —
+  is captured in the SAME commit as the main work, leaving no uncommitted tail. It
+  runs on BOTH the post-ran and `--skip-post` paths. Only after the
+  zero-knowledge-loss gate passes (every `> LEARNED:` promoted, index valid —
+  re-checked here in case the post-phase added a marker) does it stage only files
+  under the knowledge dir into **one** `feat|chore(<tag>): <message>` commit, then
+  push **only if `AGENTWARE_KB_PUSH` is on** (default). When push is off, the loop
+  logs a skip line with instructions to push manually. The `<message>` is derived
   **deterministically** (no LLM/network) so the subject says *what was worked on*,
   not a generic file list: `run_kb_sync` reads the plan's one-line title
   (`# Plan: <title>` in `<knowledge-dir>/work/<feature>/plan.md`) and passes it as
