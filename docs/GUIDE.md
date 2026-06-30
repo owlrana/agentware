@@ -273,6 +273,27 @@ rather than loop forever.
 > prose, and even then it can't touch the derived files. Every merge is gated on an
 > entry-ID superset check before it's allowed to leave your machine.
 
+### Per-user provenance contract (team mode)
+
+In team mode, every KB artifact carries an **author** handle for attribution:
+
+- **Resolution**: `AGENTWARE_USER_HANDLE` env → `~/.agentware/config.env` →
+  `_operator_handle(kdir)` (power-user fallback). The per-machine config is
+  authoritative and never committed to the KB repo.
+- **Writers that stamp `author`**: `learn`, `decide`, `index add` (frontmatter
+  backfill), `plan new`/`add-task`, profiles, system-profile entries. Each has an
+  `--author` override; without it, the config-level handle is used.
+- **Author is RECORD-ONLY attribution**: it answers "who wrote this?" for audit
+  and provenance. It has **zero effect on retrieval**: the ranking formula is
+  `final = bm25_relevance × acr(entry, as_of)` where `acr = source_weight ×
+  freshness`. `source_weight` depends on `source` (user/agent/imported), NOT on
+  `author`. Two members running the SAME query against the SAME KB state get
+  **byte-identical results** regardless of their handle.
+- **EXECUTOR ≠ AUTHOR**: A plan's `author` is provenance metadata (who designed
+  it). The EXECUTOR is resolved at runtime from the per-machine config and
+  determines which profile overlay is injected. The LLM is told explicitly that
+  author is provenance only and must never adopt the author's identity/paths.
+
 ---
 
 ## Recall, benchmarking & metrics (deterministic — you own the numbers)

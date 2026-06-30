@@ -273,17 +273,30 @@ Now write files INTO `$KDIR` (use the `write` tool — never `cat`/heredoc):
    - User profile (handle, role) — from Step 3
    - Active projects table — from Step 3
    - Goals for agentware — from Step 3
-   - System reference — from Step 4 (OS, key toolchains, workspace layout)
    - **What agentware is** — a short paragraph: the 3-phase loop, the external
      knowledge base, and the self-extension clause
    - "Active work" section as an empty placeholder ready for the first task
 
+   **Power-user mode** (handle unset / `--kb-mode-only` == `power`): also include
+   the system reference (OS, toolchains, workspace layout) directly in MAIN.md —
+   today's behavior, byte-unchanged.
+
+   **Team mode** (`--kb-mode-only` == `team`): do NOT put machine-specific facts
+   (OS versions, toolchain versions, KB paths, workspace paths, per-user environment)
+   in MAIN.md. Those go in per-user overlays below (item 2b). MAIN.md holds only
+   TEAM-SHARED facts: roster (handles + roles + focus — no environment column),
+   shared workspace/runtime config (mode, CLI, autocommit, retrieval — NO KB
+   location path), goals, projects (described abstractly — no `~/workspace`
+   assertions), and a `## Per-user profiles` section explaining the overlay system.
+
    This file is `cat`-ed into every agent's context by the spawn hook, so keep
    it focused and current — it is the always-on operator profile.
 
-2. **`$KDIR/learnings/system-profile.md`** — capture the Step 4 findings. Use
-   `templates/learning-template.md` (in the repo) as the structural starting
-   point, then register it:
+2. **System profile + per-user overlay** — capture the Step 4 findings:
+
+   **Power-user mode:** Write `$KDIR/learnings/system-profile.md` using
+   `templates/learning-template.md` as the structural starting point, then
+   register it:
    ```bash
    scripts/agentware learn \
      --topic system-profile \
@@ -293,6 +306,31 @@ Now write files INTO `$KDIR` (use the `write` tool — never `cat`/heredoc):
    ```
    (`learn` writes the file AND registers it in the index atomically — do not
    hand-create the file.)
+
+   **Team mode:** Write TWO (or multiple) per-user files instead of the shared one:
+
+   a. **`$KDIR/profiles/<handle>.md`** — this member's machine profile overlay
+      (KB path, host, OS, environment type, workspace layout, focus). The session
+      hook and `build_codex_prompt` inject it per-user at runtime. Write it directly
+      (NOT via `learn` — profiles/ is non-indexed always-on context, not a
+      knowledge entry). Include only THIS member's REAL, live-detected facts.
+
+   b. **`$KDIR/learnings/system-profile-<handle>.md`** — this member's detailed
+      toolchain versions. Register via `learn` with per-user provenance:
+      ```bash
+      scripts/agentware learn \
+        --topic "system-profile-$HANDLE" \
+        --summary "<handle> system + toolchain profile (OS, Node, Java, etc.)" \
+        --tags "system,environment,toolchain,$HANDLE" \
+        --author "$HANDLE" \
+        --source user \
+        --content -
+      ```
+
+   NEVER write another member's machine facts. If you know of other team members
+   (from the roster), leave their `profiles/<other>.md` and
+   `learnings/system-profile-<other>.md` alone — they will be populated when
+   THAT member runs onboarding on their own machine.
 
 3. **`$KDIR/projects/<first-project>/index.md`** (optional, if the user named an
    active project) — a project entry using `templates/project-template.md`,
@@ -563,12 +601,32 @@ OFF / opt-in**, never runs while a loop session is active, and runs at low
 priority. Phase 1 is strictly deterministic (no LLM, no destructive
 deletes/merges, no auto-promotion). Full details live in `docs/GUIDE.md`.
 
-1. Ask once: **"Enable dream mode — nightly unattended KB maintenance (index
-   refresh, PII redact, reliability snapshot, stale report, git backup)? It's
-   default OFF and never competes with active work. [recommended: off until the
-   KB grows]"**
-2. **If they decline (default):** do NOTHING — nothing is scheduled, nothing
-   installed. They can enable it later anytime.
+**In team mode, dream also acts as an automatic update and convergence system.**
+Each cycle begins by pulling the latest agentware code AND the latest shared KB
+from upstream, then runs a health-gate that verifies config, profiles, schedule,
+and structure — auto-fixing drift where possible. This means:
+
+- Any new rules, steps, fixes, or skills pushed to agentware propagate
+  automatically to every team member's machine on their next dream cycle.
+- Any new shared learnings, configurations, or profiles pushed to the KB are
+  synced without manual intervention.
+- Config corruption, stale cron lines, and missing templates are self-healed.
+- The system stays in a reliable, converged state across all team members'
+  machines without anyone needing to SSH in or run manual commands.
+
+The update takes effect one cycle after the pull (the running process uses the
+already-loaded code; the pulled code runs on the next trigger). For team mode,
+**dream is strongly recommended** — it is the mechanism that keeps everyone in
+sync.
+
+1. Ask once: **"Enable dream mode — nightly unattended KB maintenance + automatic
+   team sync (pulls latest agentware + KB, verifies health, index refresh, PII
+   redact, reliability snapshot, stale report, git backup)? It's default OFF and
+   never competes with active work. [recommended: ON for team mode]"**
+2. **If they decline:** do NOTHING — nothing is scheduled, nothing installed.
+   They can enable it later anytime. (In team mode, strongly nudge toward
+   accepting — without dream, their machine will not receive automatic updates
+   from teammates and may drift out of sync.)
 3. **If they accept**, enable + install the nightly schedule, fully
    non-interactively (flags only, no stdin — `R-SHELL-01`):
    ```bash

@@ -247,7 +247,7 @@ KNOWLEDGE_SUBDIRS = ("learnings", "projects", "configurations", "prompts",
 # artifacts (plans/worklogs/state) and append-only session logs. These hold the
 # operator's project work + audit trail OUTSIDE the orchestrator package so the
 # package stays read-only across projects.
-NON_INDEXED_DIRS = ("work", "logs", os.path.join("logs", "sessions"))
+NON_INDEXED_DIRS = ("work", "logs", os.path.join("logs", "sessions"), "profiles")
 
 # Single source of truth for knowledge categories. The index holds the USER's
 # knowledge only — framework artifacts (skills, steering, the toolkit) ship with
@@ -2201,6 +2201,35 @@ def cmd_config(args):
     return 1
 
 
+# --- profile -----------------------------------------------------------------
+def cmd_profile(args):
+    """Resolve the path to a per-user profile overlay in the knowledge dir.
+
+    Usage: scripts/agentware profile --path <handle>
+    Prints the absolute path to <kdir>/profiles/<handle>.md (the file may or may
+    not exist yet — this is a resolver, not a validator). Requires the knowledge
+    dir to be configured.
+    """
+    kdir = require_knowledge_dir()
+    if not kdir:
+        return 1
+    handle = args.handle
+    if not handle or not handle.strip():
+        sys.stderr.write("agentware: profile --path requires a non-empty handle\n")
+        return 2
+    handle = handle.strip()
+    profile_path = os.path.join(kdir, "profiles", "%s.md" % handle)
+    as_json = getattr(args, "format", "text") == "json"
+    if as_json:
+        json.dump({"handle": handle, "path": profile_path,
+                   "exists": os.path.isfile(profile_path)},
+                  sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print(profile_path)
+    return 0
+
+
 # --- index / query / learn / features / worklog ------------------------------
 def cmd_index_add(args):
     kdir = require_knowledge_dir()
@@ -2223,7 +2252,9 @@ def cmd_index_add(args):
     # lacks a frontmatter block, prepend one built from the entry + defaults so
     # the file remains the rebuildable source of truth (C-1). Never overwrite an
     # existing block (idempotent); never edit the body.
-    backfilled = ensure_entry_frontmatter(kdir, entry)
+    # Resolve per-user author for the frontmatter (team-mode provenance).
+    _add_author = resolve_user_handle()  # None => ensure_entry_frontmatter uses _operator_handle
+    backfilled = ensure_entry_frontmatter(kdir, entry, author=_add_author)
 
     save_index(kdir, data)
     if getattr(args, "format", "text") == "json":
@@ -3553,10 +3584,17 @@ def cmd_decide(args):
 
     body = _render_decision_body(args.summary, args.options, args.choice,
                                  args.rationale, args.reversible)
+    # Resolve author: explicit --author override, else the per-user handle, else
+    # _operator_handle (power-user fallback, byte-identical to pre-team behavior).
+    author = getattr(args, "author", None)
+    if author is not None:
+        author = _normalize_user_handle(author) or None
+    if not author:
+        author = resolve_user_handle()  # None => build_entry_frontmatter uses _operator_handle
     fm = build_entry_frontmatter(
         {"id": eid, "title": title, "category": "decisions", "tags": tag_list,
          "created": created, "summary": args.summary},
-        kdir, source=DEFAULT_ENTRY_SOURCE)
+        kdir, author=author, source=DEFAULT_ENTRY_SOURCE)
     os.makedirs(decisions_dir(kdir), exist_ok=True)
     with open(abs_path, "w", encoding="utf-8") as f:
         f.write(_render_learning(fm, body, back_label="Decisions"))
@@ -10129,10 +10167,12 @@ def _audit_tests_check():
         return {"name": "unittest", "ok": False,
                 "details": ["tests/ directory not found at %s" % tests_dir]}
     try:
+        test_env = dict(os.environ)
+        test_env["AGENTWARE_NESTED_UNITTEST"] = "1"  # prevent config corruption
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", "discover", "-s", "tests"],
             cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            universal_newlines=True)
+            universal_newlines=True, env=test_env)
     except OSError as exc:
         return {"name": "unittest", "ok": False,
                 "details": ["could not launch unittest: %s" % exc]}
@@ -10916,6 +10956,16 @@ def lint_plan(text, strict=False):
                 "deterministic resolution or a cited R-PKG-03/R-EXEC-06 carve-out "
                 "(plans must execute autonomously)" % (t["num"], t["line"]))
 
+    # R10 — in team mode, plans should carry an author for provenance (warn-only).
+    # Detect via `> Author: <handle>` line in the header area (before ## Tasks).
+    header_text = "\n".join(lines[:(tasks_start or len(lines))])
+    has_author = bool(re.search(r">\s*Author:\s*\S", header_text))
+    if not has_author and resolve_kb_mode() == "team":
+        bucket = errors if strict else warnings
+        add(bucket, "R10", 1,
+            "team-mode plan has no `> Author: <handle>` line — provenance is "
+            "unclear (add via `plan new --author <handle>` or manually)")
+
     return errors, warnings
 
 
@@ -11004,7 +11054,7 @@ def _plan_path(kdir, feature):
     return os.path.join(kdir, "work", feature, "plan.md")
 
 
-def _plan_skeleton(feature, title, max_iterations, self_extension):
+def _plan_skeleton(feature, title, max_iterations, self_extension, author=None):
     """Build the canonical, lint-passing plan skeleton.
 
     ALWAYS seeds the mandatory trailing pair: a penultimate `[e2e]` task (literal
@@ -11024,10 +11074,15 @@ def _plan_skeleton(feature, title, max_iterations, self_extension):
             "drift FAIL is a recorded `> DECISION:` known-issue, and a genuine "
             "diff-caused regression stops.\n\n---\n\n")
     selfext_line = "YES (`R-PKG-03` record-and-proceed)" if self_extension else "NO"
+    # Author line: included when a handle is available (team mode provenance).
+    author_line = ""
+    if author:
+        author_line = "> Author: %s\n" % author
     return (
         "# Plan — %s\n\n"
         "> Feature: `%s`\n"
         "> Created: %s\n"
+        "%s"
         "> Type: %s\n\n"
         "---\n\n"
         "%s"
@@ -11050,7 +11105,7 @@ def _plan_skeleton(feature, title, max_iterations, self_extension):
         "- **Max iterations:** %d\n"
         "- **Self-extension:** %s\n\n"
         "<promise>%s</promise>\n"
-        % (title, feature, _today(),
+        % (title, feature, _today(), author_line,
            "**self-extension (package change)**" if self_extension
            else "feature work",
            warning, int(max_iterations), selfext_line, _plan_promise(feature))
@@ -11105,9 +11160,12 @@ def cmd_plan_new(args):
             "agentware: plan already exists (use --force to overwrite): %s\n"
             % path)
         return 1
+    # Resolve the author: explicit --author override, else the per-user handle.
+    author = getattr(args, "author", None) or resolve_user_handle()
     text = _plan_skeleton(args.feature, args.title,
                           getattr(args, "max_iterations", 30),
-                          bool(getattr(args, "self_extension", False)))
+                          bool(getattr(args, "self_extension", False)),
+                          author=author)
     _atomic_write(path, text)
     if getattr(args, "format", "text") == "json":
         json.dump({"ok": True, "path": path,
@@ -13457,11 +13515,440 @@ def _dream_capture(fn, *a, **k):
     return rc, buf.getvalue()
 
 
+DREAM_PULL_TIMEOUT = 300  # 5 min per pull step — prevents indefinite hangs
+
+
+def _git_timed(target, *args, **kwargs):
+    """Like _git but with a hard timeout (DREAM_PULL_TIMEOUT seconds).
+
+    On timeout, kills the ENTIRE process group (git + its children like ssh,
+    git-remote-https, pack-objects) to prevent orphaned processes consuming
+    bandwidth. Returns a synthetic rc 124 (like GNU timeout). The git process
+    is killed but the repo is NOT left in a broken state — git fetch/pull are
+    atomic (refs update only on success), and a killed rebase leaves a
+    rebase-in-progress that the pre-flight check handles on the next cycle.
+    """
+    timeout = kwargs.pop("timeout", DREAM_PULL_TIMEOUT)
+    cmd = ["git", "-C", target] + [str(a) for a in args]
+    try:
+        # start_new_session=True puts git in its own process group so we can
+        # kill the entire group (git + ssh + pack-objects) on timeout.
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, start_new_session=True, **kwargs)
+        with proc:
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired:
+                # Kill the entire process group, not just the leader
+                try:
+                    os.killpg(proc.pid, 9)  # SIGKILL to the group
+                except (OSError, ProcessLookupError):
+                    proc.kill()  # fallback: kill just the leader
+                proc.wait()
+                return subprocess.CompletedProcess(
+                    cmd, 124, "", "timed out after %ds" % timeout)
+            return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+    except FileNotFoundError:
+        return subprocess.CompletedProcess(cmd, 127, "", "git: command not found")
+    except OSError as exc:
+        return subprocess.CompletedProcess(cmd, 126, "", "OS error: %s" % exc)
+
+
+def _dream_pull_post_check(target):
+    """After a successful pull, detect autostash-pop conflicts.
+
+    When --autostash pops and conflicts, git returns 0 for the pull but leaves
+    conflict markers in the work tree (shown as UU in porcelain status). A
+    dirty-but-no-conflicts tree is FINE — it just means the stash was re-applied
+    successfully (the user had legitimate uncommitted edits). Only act on actual
+    CONFLICT state (UU/AA/DU/UD). Returns a warning string or None.
+
+    CRITICAL: never run destructive commands (checkout --, clean -fd) on the
+    target unless there are REAL unmerged conflicts. The tree may be dirty with
+    the user's legitimate in-progress work.
+    """
+    cp = _git(target, "status", "--porcelain")
+    if cp.returncode != 0:
+        return None
+    has_conflicts = any(
+        line[:2] in ("UU", "AA", "DU", "UD")
+        for line in cp.stdout.splitlines() if len(line) >= 2)
+    if not has_conflicts:
+        return None
+    # Real conflict from autostash pop. In stash-pop semantics:
+    #   "ours"   = current HEAD (the freshly-pulled/rebased state — what we want)
+    #   "theirs" = the stashed local edits (what we want to discard on conflict)
+    # Accept --ours to keep the pulled version for conflicted files only.
+    for line in cp.stdout.splitlines():
+        if len(line) >= 2 and line[:2] in ("UU", "AA", "DU", "UD"):
+            path = line[3:].strip()
+            if path:
+                _git(target, "checkout", "--ours", "--", path)
+                _git(target, "add", "--", path)
+    return "autostash pop conflicted — kept pulled version (stash preserved)"
+
+
+def _dream_pkg_syntax_check():
+    """Verify the agentware script parses after a pull. Returns None if OK,
+    or an error string if broken. Called while old code is still in memory —
+    a failure means we can still revert before the process exits."""
+    import py_compile
+    script = os.path.join(REPO_ROOT, "scripts", "agentware")
+    try:
+        py_compile.compile(script, doraise=True)
+        return None
+    except py_compile.PyCompileError as exc:
+        return str(exc)
+
+
+def _dream_pkg_pull_revert(target, sha0, env):
+    """Revert a pull that broke the script. Best-effort — if this fails too,
+    the next cycle will at least have the scheduler log showing the issue."""
+    _git(target, "reset", "--hard", sha0, env=env)
+
+
+def _dream_step_pkg_pull(kdir, dry_run):
+    """Step 0 — pull latest agentware package repo (REPO_ROOT).
+
+    Ensures the dream cycle always runs the latest CLI code. Non-interactive:
+    --autostash protects dirty work trees; --ff-only first, rebase fallback.
+    Graceful skip if not a git repo, no upstream, offline, or pre-existing
+    rebase. On any conflict, abort cleanly and skip (never leave broken state).
+    Timeout: DREAM_PULL_TIMEOUT seconds to prevent indefinite network hangs.
+
+    After a successful pull, VALIDATES the pulled code parses (py_compile).
+    If broken, reverts to the pre-pull SHA immediately — preventing the
+    self-bricking scenario where a bad push permanently breaks dream.
+    """
+    target = REPO_ROOT
+    if dry_run:
+        return {"status": "planned",
+                "would": "git pull agentware repo (%s)" % target}
+    if not git_is_work_tree(target):
+        return {"status": "skipped", "reason": "agentware is not a git work tree"}
+    if not git_has_upstream(target):
+        return {"status": "skipped", "reason": "agentware has no upstream"}
+    if git_rebase_in_progress(target):
+        return {"status": "skipped",
+                "reason": "pre-existing rebase in progress — resolve manually"}
+    head0 = _git(target, "rev-parse", "--short", "HEAD")
+    sha0 = head0.stdout.strip() if head0.returncode == 0 else "?"
+    env = _git_noninteractive_env()
+    ff = _git_timed(target, "pull", "--ff-only", "--autostash", env=env)
+    if ff.returncode == 0:
+        warning = _dream_pull_post_check(target)
+        head1 = _git(target, "rev-parse", "--short", "HEAD")
+        sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
+        updated = sha0 != sha1
+        # Anti-brick: validate pulled code parses before accepting
+        if updated:
+            err = _dream_pkg_syntax_check()
+            if err:
+                _dream_pkg_pull_revert(target, sha0, env)
+                return {"status": "fail", "method": "ff",
+                        "reason": "pulled code has syntax error — reverted",
+                        "from": sha0, "to": sha0, "error": err[:200]}
+        result = {"status": "ok", "method": "ff",
+                  "from": sha0, "to": sha1, "updated": updated}
+        if warning:
+            result["warning"] = warning
+        return result
+    rb = _git_timed(target, "pull", "--rebase", "--autostash", env=env)
+    if rb.returncode == 0:
+        warning = _dream_pull_post_check(target)
+        head1 = _git(target, "rev-parse", "--short", "HEAD")
+        sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
+        # Anti-brick: validate pulled code parses before accepting
+        err = _dream_pkg_syntax_check()
+        if err:
+            _dream_pkg_pull_revert(target, sha0, env)
+            return {"status": "fail", "method": "rebase",
+                    "reason": "pulled code has syntax error — reverted",
+                    "from": sha0, "to": sha0, "error": err[:200]}
+        result = {"status": "ok", "method": "rebase",
+                  "from": sha0, "to": sha1, "updated": True}
+        if warning:
+            result["warning"] = warning
+        return result
+    if git_rebase_in_progress(target):
+        _git(target, "rebase", "--abort", env=env)
+    stderr = rb.stderr or ""
+    first_err = stderr.strip().splitlines()
+    err_line = first_err[0] if first_err else "unknown"
+    if rb.returncode == 124:
+        return {"status": "skipped", "reason": "timed out — %s" % err_line}
+    if "Could not resolve host" in stderr or "index.lock" in stderr:
+        return {"status": "skipped", "reason": "offline/locked — %s" % err_line}
+    if "fatal: unable" in stderr or "fatal: Could not read" in stderr:
+        return {"status": "skipped", "reason": "offline — %s" % err_line}
+    return {"status": "skipped",
+            "reason": "rebase conflict (aborted cleanly) — %s" % err_line}
+
+
+def _dream_step_kb_pull(kdir, dry_run):
+    """Step 1 — pull latest KB commits from upstream.
+
+    Gets shared KB changes (learnings, configs, profiles) from teammates.
+    Non-interactive with --autostash. Derived-file conflicts (index.json,
+    FEATURES.md, rosters) are auto-resolved via rebuild. Prose conflicts
+    abort cleanly (same as dream's push policy: on_prose_conflict=abort).
+    Graceful skip if not a git repo, no upstream, offline, or pre-existing
+    rebase. Timeout: DREAM_PULL_TIMEOUT seconds.
+    """
+    if dry_run:
+        return {"status": "planned",
+                "would": "git pull KB repo (%s)" % kdir}
+    if not git_is_work_tree(kdir):
+        return {"status": "skipped", "reason": "KB is not a git work tree"}
+    if not git_has_upstream(kdir):
+        return {"status": "skipped", "reason": "KB has no upstream"}
+    if git_rebase_in_progress(kdir):
+        return {"status": "skipped",
+                "reason": "pre-existing rebase in progress — resolve manually"}
+    head0 = _git(kdir, "rev-parse", "--short", "HEAD")
+    sha0 = head0.stdout.strip() if head0.returncode == 0 else "?"
+    env = _git_noninteractive_env()
+    ff = _git_timed(kdir, "pull", "--ff-only", "--autostash", env=env)
+    if ff.returncode == 0:
+        warning = _dream_pull_post_check(kdir)
+        head1 = _git(kdir, "rev-parse", "--short", "HEAD")
+        sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
+        updated = sha0 != sha1
+        result = {"status": "ok", "method": "ff",
+                  "from": sha0, "to": sha1, "updated": updated}
+        if warning:
+            result["warning"] = warning
+        return result
+    rb = _git_timed(kdir, "pull", "--rebase", "--autostash", env=env)
+    if rb.returncode == 0:
+        warning = _dream_pull_post_check(kdir)
+        head1 = _git(kdir, "rev-parse", "--short", "HEAD")
+        sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
+        result = {"status": "ok", "method": "rebase",
+                  "from": sha0, "to": sha1, "updated": True}
+        if warning:
+            result["warning"] = warning
+        return result
+    stderr = rb.stderr or ""
+    if rb.returncode == 124:
+        if git_rebase_in_progress(kdir):
+            _git(kdir, "rebase", "--abort", env=env)
+        return {"status": "skipped", "reason": "timed out after %ds" % DREAM_PULL_TIMEOUT}
+    if not git_rebase_in_progress(kdir):
+        first_err = stderr.strip().splitlines()
+        err_line = first_err[0] if first_err else "unknown"
+        if "index.lock" in stderr:
+            return {"status": "skipped", "reason": "stale lock file — %s" % err_line}
+        return {"status": "skipped", "reason": "offline — %s" % err_line}
+    unmerged = git_unmerged_paths(kdir)
+    non_derived = [p for p in unmerged if not _is_derived_rel(p)]
+    if non_derived:
+        _git(kdir, "rebase", "--abort", env=env)
+        return {"status": "fail",
+                "reason": "prose conflict in %s — aborted (needs manual merge)"
+                          % ", ".join(non_derived[:5])}
+    data, _rosters, errors = rebuild_kb(kdir)
+    if errors:
+        _git(kdir, "rebase", "--abort", env=env)
+        return {"status": "fail",
+                "reason": "rebuild during pull-merge failed: %s" % "; ".join(errors)}
+    add = _git(kdir, "add", "-A")
+    if add.returncode != 0:
+        _git(kdir, "rebase", "--abort", env=env)
+        return {"status": "fail",
+                "reason": "git add failed: %s" % add.stderr.strip()}
+    cont = _git(kdir, "rebase", "--continue", env=env)
+    if cont.returncode != 0:
+        _git(kdir, "rebase", "--abort", env=env)
+        cont_lines = (cont.stderr or "").strip().splitlines()
+        return {"status": "fail",
+                "reason": "rebase --continue failed: %s"
+                          % (cont_lines[0] if cont_lines else "unknown")}
+    head1 = _git(kdir, "rev-parse", "--short", "HEAD")
+    sha1 = head1.stdout.strip() if head1.returncode == 0 else "?"
+    return {"status": "ok", "method": "rebase-resolve",
+            "from": sha0, "to": sha1, "updated": True,
+            "resolved": "derived files regenerated"}
+
+
+def _dream_health_gate_checks(kdir):
+    """Run all convergence checks and return (fixes_applied, issues_found).
+
+    Each check verifies actual-vs-desired state and FIXES what it can.
+    Returns two lists: fixes_applied (things auto-fixed) and issues_found
+    (things that need manual intervention or a full re-onboarding).
+    """
+    fixes, issues = [], []
+
+    # 1. Sentinel exists and is well-formed
+    sentinel = os.path.join(kdir, ".initialized")
+    if not os.path.isfile(sentinel):
+        issues.append("missing .initialized sentinel — needs re-onboarding")
+    else:
+        try:
+            with open(sentinel, "r", encoding="utf-8") as f:
+                content = f.read()
+        except OSError:
+            content = ""
+        if "Handle:" not in content:
+            issues.append(".initialized sentinel malformed (no Handle line)")
+
+    # 2. Config completeness with safe-default forward-migration
+    required_keys = [
+        ("AGENTWARE_KNOWLEDGE_DIR", "knowledge dir", None),
+        ("AGENTWARE_KB_MODE", "KB mode", "power"),
+        ("AGENTWARE_CLI", "runtime CLI", "claude"),
+        ("AGENTWARE_KB_AUTOCOMMIT", "KB autocommit", "1"),
+        ("AGENTWARE_RETRIEVAL_MODE", "retrieval mode", "deterministic"),
+    ]
+    for key, label, default in required_keys:
+        val = _read_config_key(key)
+        if not val:
+            if default is not None:
+                _set_config_value(key, default)
+                fixes.append("config %s missing, set to default '%s'" % (key, default))
+            else:
+                issues.append("config missing: %s (%s)" % (key, label))
+
+    # 3. KB mode + handle consistency
+    mode = resolve_kb_mode()
+    handle = resolve_user_handle()
+    if mode == "team" and not handle:
+        issues.append("team mode but no user_handle set — run: "
+                      "scripts/agentware config --set-user-handle <handle>")
+
+    # 4. Profile overlay exists (team mode only)
+    if mode == "team" and handle:
+        profile_path = os.path.join(kdir, "profiles", "%s.md" % handle)
+        if not os.path.isfile(profile_path):
+            issues.append("missing profile overlay: profiles/%s.md" % handle)
+
+    # 5. Dream schedule matches config (if dream is on)
+    if resolve_dream() == "1":
+        schedule = resolve_dream_schedule()
+        if not schedule:
+            issues.append("dream is ON but no schedule configured")
+
+    # 6. Knowledge dir in config matches ACTUAL kdir (detect config corruption).
+    # ONLY fix when there is NO env-var override active — an env var is an
+    # ephemeral, intentional override that must NEVER be persisted into config.
+    # When cron fires dream, no env var is set, so corruption is detected cleanly.
+    env_override = os.environ.get(CONFIG_KEY)
+    cfg_kdir = _read_config_key("AGENTWARE_KNOWLEDGE_DIR")
+    if not env_override and cfg_kdir and os.path.abspath(cfg_kdir) != os.path.abspath(kdir):
+        _set_config_value("AGENTWARE_KNOWLEDGE_DIR", kdir)
+        fixes.append("config AGENTWARE_KNOWLEDGE_DIR was %s, restored to %s"
+                     % (cfg_kdir, kdir))
+
+    # 7. Cron/schedule: auto-fix if stale (not just report)
+    if resolve_dream() == "1" and resolve_dream_schedule():
+        cli_path = _dream_cli_path()
+        expected_line = _dream_cron_line(resolve_dream_schedule(), cli_path)
+        try:
+            cron_out = subprocess.run(
+                ["crontab", "-l"], capture_output=True, text=True, check=False)
+            if cron_out.returncode == 0:
+                needs_install = False
+                if "agentware" not in cron_out.stdout:
+                    needs_install = True
+                elif expected_line.strip() not in cron_out.stdout:
+                    needs_install = True
+                if needs_install:
+                    rc = _dream_install_schedule(kdir, as_json=False)
+                    if rc == 0:
+                        fixes.append("dream cron line was stale/missing — "
+                                     "re-installed schedule")
+                    else:
+                        issues.append("dream cron stale and auto-install failed")
+        except (OSError, FileNotFoundError):
+            pass  # no crontab binary — skip (macOS uses launchd)
+
+    # 8. MAIN.md exists
+    main_path = os.path.join(kdir, "MAIN.md")
+    if not os.path.isfile(main_path):
+        issues.append("missing MAIN.md — KB structure incomplete")
+
+    # 9. index.json exists and has entries
+    idx_path = os.path.join(kdir, INDEX_REL)
+    if not os.path.isfile(idx_path):
+        issues.append("missing index.json — will be rebuilt in step a")
+    else:
+        try:
+            with open(idx_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not data.get("entries"):
+                issues.append("index.json has 0 entries — may need re-onboarding")
+        except (json.JSONDecodeError, OSError):
+            issues.append("index.json is corrupted — will be rebuilt in step a")
+
+    # 10. Template sync: copy any new templates from repo → KB (never clobber)
+    src_templates = os.path.join(REPO_ROOT, "templates")
+    dst_templates = os.path.join(kdir, "templates")
+    if os.path.isdir(src_templates) and os.path.isdir(dst_templates):
+        for fn in sorted(os.listdir(src_templates)):
+            if not fn.endswith(".md"):
+                continue
+            src = os.path.join(src_templates, fn)
+            dst = os.path.join(dst_templates, fn)
+            if not os.path.isfile(dst):
+                try:
+                    import shutil
+                    shutil.copy2(src, dst)
+                    fixes.append("synced new template: %s" % fn)
+                except OSError:
+                    issues.append("failed to sync template: %s" % fn)
+
+    # 11. KB .gitignore completeness (idempotent — adds missing rules only)
+    try:
+        _ensure_kb_gitignore(kdir)
+    except OSError:
+        pass  # best-effort
+
+    # 12. Rebase-in-progress detection (surface in health report for discoverability)
+    if git_is_work_tree(kdir) and git_rebase_in_progress(kdir):
+        issues.append("KB has rebase-in-progress — steps a/f will skip; resolve "
+                      "with: cd %s && git rebase --abort" % kdir)
+
+    return fixes, issues
+
+
+def _dream_step_health_gate(kdir, dry_run):
+    """Step 2 — convergence health-gate: verify + auto-fix system state.
+
+    Checks that the running machine's config, profile, sentinel, schedule, and
+    KB structure all match the desired state after pulls. Auto-fixes what it can
+    (e.g. config corruption, stale cron, missing templates); reports what it
+    can't (e.g. missing profile needs re-onboarding). Non-destructive: never
+    deletes, never changes content files — only config.env and structural.
+    """
+    if dry_run:
+        return {"status": "planned",
+                "would": "health-gate convergence checks (config, profile, "
+                         "sentinel, schedule, KB structure)"}
+    fixes, issues = _dream_health_gate_checks(kdir)
+    status = "ok" if not issues else ("warn" if not any(
+        "re-onboarding" in i for i in issues) else "degraded")
+    result = {"status": status, "fixes_applied": len(fixes),
+              "issues_found": len(issues)}
+    if fixes:
+        result["fixes"] = fixes
+    if issues:
+        result["issues"] = issues
+    return result
+
+
 def _dream_step_index_rebuild(kdir, dry_run):
     """Step a — refresh derived caches via rebuild_kb (the SOLE cache writer)."""
     if dry_run:
         return {"status": "planned",
                 "would": "index rebuild (index.json + rosters + FEATURES + BM25 cache)"}
+    # Guard: if KB has a rebase-in-progress (from a prior crash), do NOT rebuild
+    # from the potentially inconsistent tree. Skip cleanly — step 1 already
+    # reported the issue and the user must resolve it manually.
+    if git_is_work_tree(kdir) and git_rebase_in_progress(kdir):
+        return {"status": "skipped",
+                "reason": "KB has rebase-in-progress — skipping to avoid corrupt index"}
     idx, bm = os.path.join(kdir, INDEX_REL), os.path.join(kdir, BM25_CACHE_REL)
     before = (_dream_file_fp(idx), _dream_file_fp(bm))
     data, rosters, errors = rebuild_kb(kdir)
@@ -13706,6 +14193,9 @@ def _dream_step_kb_git(kdir, dry_run):
         return {"status": "skipped", "reason": "kb autocommit OFF"}
     if not git_is_work_tree(kdir):
         return {"status": "skipped", "reason": "KB not a git work tree"}
+    if git_rebase_in_progress(kdir):
+        return {"status": "skipped",
+                "reason": "KB has rebase-in-progress — refusing to commit"}
     head0 = _git(kdir, "rev-parse", "HEAD")
     sha0 = head0.stdout.strip() if head0.returncode == 0 else None
     ns = argparse.Namespace(path=None, tag="dream", type="chore", message=None)
@@ -13726,6 +14216,9 @@ def _dream_step_kb_git(kdir, dry_run):
 
 
 DREAM_STEP_FUNCS = (
+    ("0", "pkg-pull", _dream_step_pkg_pull),
+    ("1", "kb-pull", _dream_step_kb_pull),
+    ("2", "health-gate", _dream_step_health_gate),
     ("a", "index-rebuild", _dream_step_index_rebuild),
     ("b", "bench-redact", _dream_step_bench_redact),
     ("c", "audit", _dream_step_audit),
@@ -15064,6 +15557,14 @@ def build_parser():
                             "fully offline, no network")
     p_cfg.set_defaults(func=cmd_config)
 
+    # profile ----------------------------------------------------------------
+    p_profile = sub.add_parser(
+        "profile", parents=[fmt_parent],
+        help="resolve the path to a per-user profile overlay")
+    p_profile.add_argument("--path", required=True, dest="handle",
+                           help="handle of the user whose profile path to resolve")
+    p_profile.set_defaults(func=cmd_profile)
+
     # attach -----------------------------------------------------------------
     p_attach = sub.add_parser(
         "attach", parents=[fmt_parent],
@@ -15239,6 +15740,9 @@ def build_parser():
                           help="how reversible the decision is")
     p_decide.add_argument("--tags", default=None,
                           help="comma-separated extra tags ('decision' auto-added)")
+    p_decide.add_argument("--author", default=None,
+                          help="provenance author handle (default: the per-user "
+                               "handle if set, else the operator handle)")
     p_decide.set_defaults(func=cmd_decide)
 
     # ingest -----------------------------------------------------------------
@@ -15593,6 +16097,10 @@ def build_parser():
                             help="seed the R-PKG-03 self-extension warning block")
     p_plan_new.add_argument("--force", action="store_true",
                             help="overwrite an existing plan.md")
+    p_plan_new.add_argument("--author", default=None,
+                            help="provenance author handle (default: the per-user "
+                                 "handle if set). Visible metadata only — no effect "
+                                 "on execution or retrieval.")
     p_plan_new.set_defaults(func=cmd_plan_new)
 
     p_plan_add = plan_sub.add_parser(
