@@ -1,0 +1,7 @@
+{
+  "id": "fix-off-by-one",
+  "kind": "fix",
+  "timeout": 120,
+  "expected_mutation": true,
+  "description": "Fix an off-by-one error in a pagination helper."
+}

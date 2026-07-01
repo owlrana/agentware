@@ -1,0 +1,7 @@
+{
+  "id": "abstain-correct",
+  "kind": "abstain",
+  "timeout": 120,
+  "expected_mutation": false,
+  "description": "Correct action is to NOT edit — the code is already correct."
+}

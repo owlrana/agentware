@@ -47,6 +47,10 @@ GOOD_PLAN = """\
 
 > A throwaway plan used only by the linter tests.
 
+## Target packages
+
+- /tmp/test-target-dir
+
 ## Tasks
 
 - ⬜ **1** Implement the first thing deterministically.
@@ -205,6 +209,10 @@ BAD_R7_NO_KB = """\
 GOOD_ALL_DONE = """\
 # Plan — all done
 
+## Target packages
+
+- /tmp/test-target-dir
+
 ## Tasks
 
 - ✅ **1** Implemented the thing; updated KB via `learn` + `index validate`.
@@ -223,6 +231,10 @@ GOOD_ALL_DONE = """\
 # (j) R9 — blocking phrasing with NO deterministic resolution -> warn / strict-fail.
 BAD_R9_BLOCKING = """\
 # Plan — non-autonomous
+
+## Target packages
+
+- /tmp/test-target-dir
 
 ## Tasks
 
@@ -243,6 +255,12 @@ BAD_R9_BLOCKING = """\
 # (j') R9 — same blocking phrasing but WITH a cited deterministic carve-out -> passes.
 GOOD_R9_CARVEOUT = """\
 # Plan — autonomous with carve-out
+
+> Author: operator
+
+## Target packages
+
+- /tmp/test-target-dir
 
 ## Tasks
 
@@ -271,6 +289,10 @@ GOOD_PHASED = """\
 
 > A phased plan used to prove the linter accepts `**N.M**` markers.
 
+## Target packages
+
+- /tmp/test-target-dir
+
 ## Tasks
 
 ### Phase 1: Foundation
@@ -298,6 +320,10 @@ GOOD_PHASED = """\
 # be flagged as malformed task markers (the narrowed `_PLAN_LETTERED_RE`).
 GOOD_PROSE_BULLETS = """\
 # Plan — prose bullets inside tasks
+
+## Target packages
+
+- /tmp/test-target-dir
 
 ## Tasks
 
@@ -613,6 +639,88 @@ class LoopLinterContractTestCase(unittest.TestCase):
             mod.PLAN_TASK_MARKER_RE,
             r"^[[:space:]]*-[[:space:]]*(⬜|🟡)[[:space:]]*\*\*[0-9]",
         )
+
+
+class R11TargetPackagesTestCase(unittest.TestCase):
+    """Tests for R11 — mandatory `## Target packages` section."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="agentware-r11-")
+        self.addCleanup(self._cleanup)
+        self.kdir = self.tmp
+
+    def _cleanup(self):
+        import shutil
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _lint(self, plan_text, strict=False):
+        path = os.path.join(self.tmp, "plan.md")
+        with open(path, "w") as f:
+            f.write(plan_text)
+        args = ["plan", "lint", "--path", path, "--format", "json"]
+        if strict:
+            args.append("--strict")
+        code, out, _err = _raw_run_cli(args, kdir=self.kdir)
+        payload = json.loads(out) if out.strip() else {}
+        return code, payload
+
+    def test_r11_missing_section_fails(self):
+        """A plan with NO `## Target packages` section FAILS R11."""
+        plan = GOOD_PLAN.replace(
+            "## Target packages\n\n- /tmp/test-target-dir\n\n", "")
+        code, payload = self._lint(plan)
+        self.assertEqual(code, 1)
+        r11_errors = [e for e in payload.get("errors", [])
+                      if e["rule"] == "R11"]
+        self.assertTrue(len(r11_errors) >= 1,
+                        "expected R11 error for missing section")
+        self.assertIn("missing", r11_errors[0]["message"].lower())
+
+    def test_r11_stub_only_fails(self):
+        """A stub-TODO-only section (no absolute/~ path) FAILS R11."""
+        plan = GOOD_PLAN.replace(
+            "- /tmp/test-target-dir",
+            "- TODO: replace with the absolute path")
+        code, payload = self._lint(plan)
+        self.assertEqual(code, 1)
+        r11_errors = [e for e in payload.get("errors", [])
+                      if e["rule"] == "R11"]
+        self.assertTrue(len(r11_errors) >= 1,
+                        "expected R11 error for stub-only section")
+
+    def test_r11_valid_absolute_path_passes(self):
+        """A section with an absolute path PASSES R11."""
+        code, payload = self._lint(GOOD_PLAN)
+        r11_errors = [e for e in payload.get("errors", [])
+                      if e["rule"] == "R11"]
+        self.assertEqual(len(r11_errors), 0,
+                         "unexpected R11 error: %s" % r11_errors)
+
+    def test_r11_tilde_path_passes(self):
+        """A section with a ~-rooted path PASSES R11."""
+        plan = GOOD_PLAN.replace(
+            "- /tmp/test-target-dir",
+            "- ~/workspace/agentware")
+        code, payload = self._lint(plan)
+        r11_errors = [e for e in payload.get("errors", [])
+                      if e["rule"] == "R11"]
+        self.assertEqual(len(r11_errors), 0,
+                         "~ path should pass R11: %s" % r11_errors)
+
+    def test_plan_target_dirs_extracts_paths(self):
+        """plan_target_dirs() returns declared paths with ~ expanded."""
+        mod = load_cli()
+        dirs = mod.plan_target_dirs(GOOD_PLAN)
+        self.assertEqual(dirs, ["/tmp/test-target-dir"])
+
+    def test_plan_target_dirs_tilde_expansion(self):
+        """plan_target_dirs() expands ~ to $HOME."""
+        mod = load_cli()
+        plan = GOOD_PLAN.replace(
+            "- /tmp/test-target-dir",
+            "- ~/workspace/agentware")
+        dirs = mod.plan_target_dirs(plan)
+        self.assertEqual(dirs, [os.path.expanduser("~/workspace/agentware")])
 
 
 if __name__ == "__main__":

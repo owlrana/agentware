@@ -100,5 +100,19 @@ criteria; (4) show the user what already exists.
 - [ ] The plan lints clean: `scripts/agentware plan lint --path <plan.md> --strict`
       exits 0 (run it before handoff — this is the loop's pre-hook gate)
 
+## Invocation-CWD context (AGENTWARE_INVOKED_FROM)
+When the session context contains an `AGENTWARE_INVOKED_FROM:` block, your FIRST
+response MUST state the resolved `project_name` and `project_dir` so the operator
+knows which checkout is targeted. Behavior is mode-aware (detect via the
+AGENTWARE_STAGE env var):
+- **Confident resolution** (project_name is non-empty): state the resolved
+  project_name + project_dir and proceed with planning.
+- **Interactive mode + ambiguous** (AGENTWARE_STAGE is unset or not `loop-*`, AND
+  the resolution is empty): ASK the operator which checkout to target.
+- **Loop mode + ambiguous** (AGENTWARE_STAGE starts with `loop-`, AND the
+  resolution is empty): write `> BLOCKER: cannot resolve target project from
+  AGENTWARE_INVOKED_FROM` to the worklog and emit `AW_BLOCKER_HALT` on a single
+  line. The loop will exit cleanly.
+
 ## Path discovery
 NEVER assume hardcoded paths. Run `pwd` first and use relative paths.

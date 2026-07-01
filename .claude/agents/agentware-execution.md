@@ -32,6 +32,20 @@ store the knowledge base, runs `scripts/agentware init`, and writes the
 sentinel). Once onboarding completes, resume the original task. If it is
 initialized, proceed normally.
 
+## Invocation-CWD context (AGENTWARE_INVOKED_FROM)
+When the session context contains an `AGENTWARE_INVOKED_FROM:` block, your FIRST
+response MUST state the resolved `project_name` and `project_dir` so the operator
+knows which checkout is targeted. Behavior is mode-aware (detect via the
+AGENTWARE_STAGE env var):
+- **Confident resolution** (project_name is non-empty): state the resolved
+  project_name + project_dir and proceed with the task.
+- **Interactive mode + ambiguous** (AGENTWARE_STAGE is unset or not `loop-*`, AND
+  the resolution is empty): ASK the operator which checkout to target.
+- **Loop mode + ambiguous** (AGENTWARE_STAGE starts with `loop-`, AND the
+  resolution is empty): write `> BLOCKER: cannot resolve target project from
+  AGENTWARE_INVOKED_FROM` to the worklog and emit `AW_BLOCKER_HALT` on a single
+  line. The loop will exit cleanly.
+
 ## Path discovery
 NEVER assume hardcoded absolute paths. Run `pwd` first and use RELATIVE paths for
 repo files. For external workspaces referenced in the plan, locate them

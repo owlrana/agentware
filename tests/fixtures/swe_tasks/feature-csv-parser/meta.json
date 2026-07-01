@@ -1,0 +1,7 @@
+{
+  "id": "feature-csv-parser",
+  "kind": "feature",
+  "timeout": 180,
+  "expected_mutation": true,
+  "description": "Implement a simple CSV row parser with quoted-field support."
+}

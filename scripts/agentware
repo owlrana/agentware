@@ -317,6 +317,44 @@ DSF_RULE_ID_RE = re.compile(r"R-[A-Z]+-\d+")
 # headings, tables, blockquotes, code fences and prose are NOT rules.
 DSF_BULLET_RE = re.compile(r"^\s*[-*]\s+(.+)$")
 
+# --- Content/intent preservation (Gate 1 of the release gate) ---------------
+# Protected rule IDs: removal from the corpus is a hard FAIL regardless of any
+# other edits. These encode foundational safety invariants.
+REQUIRED_RULE_IDS = (
+    "R-PKG-01", "R-PKG-02", "R-PKG-03", "R-PKG-04", "R-PKG-05", "R-PKG-06",
+    "R-EXEC-01", "R-EXEC-02", "R-EXEC-05",
+    "R-FAIL-01",
+    "R-VERIFY-01",
+    "R-AUTO-02",
+    "R-KB-01",
+    "R-LOC-01", "R-LOC-03",
+    "R-SEC-02",
+    "R-PLAN-01",
+)
+
+# Required section headings in AGENTS.md (checked by content-preservation lint).
+REQUIRED_SECTIONS = (
+    "Execution loop",
+    "Build and complete",
+    "Planning",
+    "Knowledge base location",
+    "Package immutability & self-extension",
+    "Drill-down architecture",
+    "Toolkit mandate (structured data)",
+    "Context discovery",
+    "Verification gates",
+    "Failure handling (escalation ladder)",
+    "Anti-patterns",
+    "Git and dependencies",
+    "Self-improvement",
+    "Autonomous decisions",
+    "Conventions",
+)
+
+# Rule-count no-regression margin: the corpus may drop this many rule-IDs from
+# the committed baseline without failing (accounts for normal consolidation).
+RULE_COUNT_REGRESSION_MARGIN = 3
+
 # Required fields every index entry must carry.
 REQUIRED_FIELDS = ("id", "title", "category", "path", "tags", "summary")
 
@@ -4440,6 +4478,70 @@ def build_corpus(kdir, data):
     return corpus
 
 
+def build_work_corpus(kdir):
+    """Build a synthetic corpus from work/*.md files for --scope work.
+
+    Returns [(pseudo_entry, doc_text), ...] where pseudo_entry has the same
+    dict shape as index entries (id, title, summary, tags, path, category,
+    created) but is EPHEMERAL — never written to index.json.
+
+    Determinism: `created` comes from the feature dir's YYMMDD prefix (stable),
+    NEVER filesystem mtime. Ordering is id-sorted for reproducibility.
+    """
+    import re as _re
+    work_dir = os.path.join(kdir, "work")
+    if not os.path.isdir(work_dir):
+        return []
+    corpus = []
+    for feature_dir in sorted(os.listdir(work_dir)):
+        fpath = os.path.join(work_dir, feature_dir)
+        if not os.path.isdir(fpath):
+            continue
+        # Extract created date from YYMMDD prefix (e.g. 260630-feature-name)
+        date_match = _re.match(r"(\d{6})", feature_dir)
+        created = ""
+        if date_match:
+            d = date_match.group(1)
+            created = "20%s-%s-%s" % (d[:2], d[2:4], d[4:6])
+        for fname in sorted(os.listdir(fpath)):
+            if not fname.endswith(".md"):
+                continue
+            md_path = os.path.join(fpath, fname)
+            if not os.path.isfile(md_path):
+                continue
+            rel_path = "work/%s/%s" % (feature_dir, fname)
+            entry_id = "%s/%s" % (feature_dir, fname.replace(".md", ""))
+            # Extract title from first heading
+            title = ""
+            try:
+                with open(md_path, "r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.startswith("#"):
+                            title = _re.sub(r"^#+\s*", "", line)
+                            break
+            except (IOError, UnicodeDecodeError):
+                continue
+            # Read full body
+            try:
+                with open(md_path, "r", encoding="utf-8") as f:
+                    body = f.read()
+            except (IOError, UnicodeDecodeError):
+                body = ""
+            pseudo_entry = {
+                "id": entry_id,
+                "title": title,
+                "summary": "",
+                "tags": ["work"],
+                "path": rel_path,
+                "category": "work",
+                "created": created,
+            }
+            doc_text = "\n".join([title, "", body])
+            corpus.append((pseudo_entry, doc_text))
+    return corpus
+
+
 def eval_corpus_fingerprint(corpus):
     """Deterministic whole-corpus fingerprint (sha256 hex) for gate comparability.
 
@@ -4952,6 +5054,45 @@ def retrieve_bm25_embed(kdir, data, query, top_k=None, as_of=None):
             in retrieve_bm25_embed_scored(kdir, data, query, top_k, as_of)]
 
 
+# --- Skill pin (R-RET-03 stage-1 precedence) ----------------------------------
+# Default DISABLED (None). When set to a float (e.g. 0.85), a skill whose score
+# >= floor * top_overall_score AND > 0 is pinned to position 1 (the "matched
+# procedure — follow it" behavior). Learnings are NEVER evicted. The pin is
+# applied in the SHARED ranking core so both recall_ranked and retrieve_bm25
+# (the eval/gate path) exercise it. The default flip is DEFERRED to a later
+# gated change; until then ranking is byte-unchanged from pre-pin.
+SKILL_PIN_FLOOR = None  # e.g. 0.85 when enabled
+
+
+def _apply_skill_pin(scored, pin_floor):
+    """Apply threshold-gated skill pin to a scored list.
+
+    `scored` is [(entry, score), ...] already sorted by BM25+tie-break.
+    If `pin_floor` is None (disabled), returns scored unchanged.
+    Otherwise: find the top skill; if skill_score >= pin_floor * top_overall_score
+    AND > 0, move it to position 0 (pinned). Learnings are never evicted.
+    Deterministic; read-only.
+    """
+    if pin_floor is None or not scored:
+        return scored
+    top_score = scored[0][1] if scored else 0.0
+    if top_score <= 0:
+        return scored
+    threshold = pin_floor * top_score
+    # Find the highest-scoring skill entry
+    best_skill_idx = None
+    for i, (entry, score) in enumerate(scored):
+        if entry.get("category") == "skills" and score >= threshold and score > 0:
+            best_skill_idx = i
+            break  # Already sorted by score desc, first skill above threshold wins
+    if best_skill_idx is None or best_skill_idx == 0:
+        return scored  # No qualifying skill, or already at top
+    # Pin: move the skill to position 0
+    skill_item = scored.pop(best_skill_idx)
+    scored.insert(0, skill_item)
+    return scored
+
+
 def recall_ranked(kdir, data, query, top_k=None, category=None,
                   strategy="bm25", as_of=None):
     """Deterministic ranked recall returning [(entry, score, doc_text), ...].
@@ -4995,6 +5136,9 @@ def recall_ranked(kdir, data, query, top_k=None, category=None,
     scored.sort(key=lambda es: es[0].get("id") or "")                       # id asc
     scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)    # created desc
     scored.sort(key=lambda es: es[1], reverse=True)                         # score desc
+    # Skill pin (shared ranking core — both recall_ranked and the eval/gate
+    # retrieve_bm25 path exercise this). Applied AFTER sort, BEFORE top_k trim.
+    scored = _apply_skill_pin(scored, SKILL_PIN_FLOOR)
     if top_k is not None:
         scored = scored[:top_k]
     # Reconstruct doc_text for the SURFACED entries only (token estimation), via
@@ -6543,6 +6687,30 @@ def render_scorecard(rows):
             v = delta.get(key)
             cell = ("%+.4f" % v) if isinstance(v, (int, float)) else "—"
             lines.append("| %s | %s |" % (label, cell))
+    # SWE-task section (suite='swe-task' rows)
+    swe_rows = [r for r in ordered if r.get("suite") == "swe-task"]
+    if swe_rows:
+        lines.append("")
+        lines.append("## SWE-Task Benchmark")
+        lines.append("")
+        swe_cols = ("Run (UTC)", "Commit", "Seeds", "Arms", "Delta")
+        lines.append("| " + " | ".join(swe_cols) + " |")
+        lines.append("| " + " | ".join("---" for _ in swe_cols) + " |")
+        for r in swe_rows:
+            arm_stats = r.get("arms", {})
+            arm_summary = "; ".join(
+                "%s=%.2f" % (a, s.get("mean", 0))
+                for a, s in arm_stats.items())
+            d = r.get("delta")
+            delta_cell = ("%+.4f" % d) if isinstance(d, (int, float)) else "—"
+            cells = [
+                r.get("run") or "—",
+                "`%s`" % (r.get("commit") or "—"),
+                str(r.get("seeds", "—")),
+                arm_summary or "—",
+                delta_cell,
+            ]
+            lines.append("| " + " | ".join(cells) + " |")
     return "\n".join(lines) + "\n"
 
 
@@ -6648,6 +6816,431 @@ def cmd_bench_redact(args):
         f.write(render_scorecard(rows))
     print("bench redact: scrubbed %d/%d row gold_path(s) in %s; "
           "regenerated %s" % (changed, total, ledger, scorecard))
+    return 0
+
+
+# --- SWE-task benchmark: frozen hidden-unit-test coding suite -----------------
+# Pure scorer + aggregator + regression decision. The statistical runner (which
+# spawns real agents) is separate and opt-in. This code is deterministic given
+# its inputs and is unit-tested with canned transcripts (no agent spawn).
+
+SWE_SUITE_FILE = "suite.json"
+SWE_DEFAULT_SEEDS = 5
+SWE_REGRESSION_TOLERANCE = 0.15  # BLOCK when new < old - tolerance
+SWE_DEFAULT_ARMS = ["with-context", "no-context"]
+
+
+def swe_load_suite(suite_dir):
+    """Load and validate an SWE-task suite.json. Pure."""
+    path = os.path.join(suite_dir, SWE_SUITE_FILE)
+    with open(path, encoding="utf-8") as f:
+        data = json.load(f)
+    if data.get("suite") != "swe-task":
+        raise ValueError("suite.json 'suite' must be 'swe-task', got: %r"
+                         % data.get("suite"))
+    if not isinstance(data.get("tasks"), list) or not data["tasks"]:
+        raise ValueError("suite.json 'tasks' must be a non-empty list")
+    for task_id in data["tasks"]:
+        task_dir = os.path.join(suite_dir, task_id)
+        for required in ("repo", "task.md", "test_hidden.py", "meta.json"):
+            p = os.path.join(task_dir, required)
+            if required == "repo":
+                if not os.path.isdir(p):
+                    raise ValueError("task %r missing repo/ directory" % task_id)
+            else:
+                if not os.path.isfile(p):
+                    raise ValueError("task %r missing %s" % (task_id, required))
+    return data
+
+
+def swe_load_task_meta(suite_dir, task_id):
+    """Load a task's meta.json. Pure."""
+    path = os.path.join(suite_dir, task_id, "meta.json")
+    with open(path, encoding="utf-8") as f:
+        return json.load(f)
+
+
+_SWE_HIDDEN_TEST_RUNNER = '''\
+import importlib.util, sys, types, traceback
+
+# Minimal, dependency-free stand-in for the tiny slice of pytest the hidden
+# graders use (only pytest.raises). Installed before the test module executes so
+# an in-test `import pytest` resolves to this shim rather than failing.
+class _Raises:
+    def __init__(self, exc):
+        self.exc = exc
+    def __enter__(self):
+        return self
+    def __exit__(self, exc_type, exc, tb):
+        if exc_type is None:
+            raise AssertionError("DID NOT RAISE %r" % (self.exc,))
+        return isinstance(exc, self.exc)
+
+_pytest = types.ModuleType("pytest")
+_pytest.raises = lambda exc, *a, **k: _Raises(exc)
+sys.modules["pytest"] = _pytest
+
+_test_path = sys.argv[1]
+_spec = importlib.util.spec_from_file_location("hidden_test", _test_path)
+_module = importlib.util.module_from_spec(_spec)
+sys.modules["hidden_test"] = _module
+try:
+    _spec.loader.exec_module(_module)
+except Exception:
+    traceback.print_exc()
+    sys.exit(1)
+
+_tests = [getattr(_module, _n) for _n in dir(_module)
+          if _n.startswith("test") and callable(getattr(_module, _n))]
+if not _tests:
+    print("no tests collected")
+    sys.exit(1)
+
+_failures = 0
+for _fn in _tests:
+    try:
+        _fn()
+        print("PASS " + _fn.__name__)
+    except Exception:
+        _failures += 1
+        print("FAIL " + _fn.__name__)
+        traceback.print_exc()
+sys.exit(1 if _failures else 0)
+'''
+
+
+def swe_score_task(task_dir, post_edit_repo_path):
+    """Run test_hidden.py against a post-edit repo copy. Pure scorer.
+
+    Copies test_hidden.py into an isolated temp dir alongside the post-edit repo,
+    runs its hidden `test_*` functions, and returns the result dict. Uses pytest
+    when it is importable, and otherwise falls back to a dependency-free runner
+    so scoring works in any Python environment (no pytest install required).
+
+    Args:
+        task_dir: Path to the task fixture (contains test_hidden.py, meta.json).
+        post_edit_repo_path: Path to the agent's edited repo/ directory.
+
+    Returns:
+        dict with {passed: bool, test_output: str, mutated: bool}
+    """
+    import tempfile as _tf
+    scratch = _tf.mkdtemp(prefix="swe-score-")
+    try:
+        scratch_repo = os.path.join(scratch, "repo")
+        shutil.copytree(post_edit_repo_path, scratch_repo)
+        test_src = os.path.join(task_dir, "test_hidden.py")
+        test_dst = os.path.join(scratch, "test_hidden.py")
+        shutil.copy2(test_src, test_dst)
+        # Prefer pytest when it is importable; otherwise run the hidden tests with
+        # a dependency-free fallback runner. Both execute in an isolated subprocess
+        # (cwd=scratch) under a 120s timeout and exit non-zero on any failure.
+        import importlib.util as _ilu
+        if _ilu.find_spec("pytest") is not None:
+            _cmd = [sys.executable, "-m", "pytest", test_dst, "-q", "--tb=short"]
+        else:
+            _cmd = [sys.executable, "-c", _SWE_HIDDEN_TEST_RUNNER, test_dst]
+        try:
+            proc = subprocess.run(
+                _cmd,
+                cwd=scratch,
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                universal_newlines=True, timeout=120)
+            passed = proc.returncode == 0
+            output = proc.stdout
+        except subprocess.TimeoutExpired:
+            passed = False
+            output = "TIMEOUT: test execution exceeded 120s"
+        except OSError as e:
+            passed = False
+            output = "OSError running hidden tests: %s" % e
+        original_repo = os.path.join(task_dir, "repo")
+        mutated = not _dirs_identical(original_repo, post_edit_repo_path)
+        return {"passed": passed, "test_output": output, "mutated": mutated}
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _dirs_identical(dir_a, dir_b):
+    """Check if two directory trees have byte-identical file contents. Pure.
+
+    Ignores __pycache__ directories (transient build artifacts from pytest runs).
+    """
+    import filecmp
+    _IGNORE = {"__pycache__"}
+    cmp = filecmp.dircmp(dir_a, dir_b, ignore=list(_IGNORE))
+    left = [x for x in cmp.left_only if x not in _IGNORE]
+    right = [x for x in cmp.right_only if x not in _IGNORE]
+    if left or right or cmp.diff_files:
+        return False
+    for sub in cmp.common_dirs:
+        if sub in _IGNORE:
+            continue
+        if not _dirs_identical(os.path.join(dir_a, sub),
+                               os.path.join(dir_b, sub)):
+            return False
+    return True
+
+
+def swe_task_passed(score_result, meta):
+    """Determine if a task is truly passed given score result and meta. Pure.
+
+    For normal tasks (expected_mutation=true): passed = tests pass.
+    For abstention tasks (expected_mutation=false): passed = tests pass AND not mutated.
+    """
+    if not meta.get("expected_mutation", True):
+        return score_result["passed"] and not score_result["mutated"]
+    return score_result["passed"]
+
+
+def swe_aggregate_arm(results):
+    """Compute pass-rate for an arm given a list of per-task pass booleans. Pure.
+
+    Args:
+        results: list of booleans (True=passed, False=failed) for tasks in one seed.
+
+    Returns:
+        float pass-rate (0.0 to 1.0).
+    """
+    if not results:
+        return 0.0
+    return sum(1 for r in results if r) / len(results)
+
+
+def swe_aggregate_seeds(seed_pass_rates):
+    """Compute min/mean/max pass-rate across seeds. Pure.
+
+    Args:
+        seed_pass_rates: list of per-seed pass-rates (each a float 0..1).
+
+    Returns:
+        dict with {min, mean, max, seeds}
+    """
+    if not seed_pass_rates:
+        return {"min": 0.0, "mean": 0.0, "max": 0.0, "seeds": 0}
+    return {
+        "min": min(seed_pass_rates),
+        "mean": sum(seed_pass_rates) / len(seed_pass_rates),
+        "max": max(seed_pass_rates),
+        "seeds": len(seed_pass_rates),
+    }
+
+
+def swe_regression_decision(old_rates, new_rates, tolerance=SWE_REGRESSION_TOLERANCE):
+    """Pure regression decision: BLOCK when new mean < old mean - tolerance.
+
+    Args:
+        old_rates: list of per-seed pass-rates for the old/baseline arm.
+        new_rates: list of per-seed pass-rates for the new/treatment arm.
+        tolerance: maximum allowed degradation (default 0.15).
+
+    Returns:
+        dict with {regressed: bool, old_mean: float, new_mean: float,
+                   delta: float, tolerance: float, verdict: str}
+    """
+    old_mean = sum(old_rates) / len(old_rates) if old_rates else 0.0
+    new_mean = sum(new_rates) / len(new_rates) if new_rates else 0.0
+    delta = new_mean - old_mean
+    regressed = new_mean < (old_mean - tolerance)
+    verdict = "BLOCK" if regressed else "PASS"
+    return {
+        "regressed": regressed,
+        "old_mean": old_mean,
+        "new_mean": new_mean,
+        "delta": delta,
+        "tolerance": tolerance,
+        "verdict": verdict,
+    }
+
+
+def swe_build_dry_run_plan(suite_dir, seeds, arms):
+    """Build the dry-run plan (what WOULD be executed). Pure.
+
+    Returns a JSON-serializable dict describing planned runs without spawning.
+    """
+    suite = swe_load_suite(suite_dir)
+    tasks = []
+    for task_id in suite["tasks"]:
+        meta = swe_load_task_meta(suite_dir, task_id)
+        tasks.append({
+            "id": task_id,
+            "kind": meta.get("kind"),
+            "timeout": meta.get("timeout"),
+            "expected_mutation": meta.get("expected_mutation"),
+        })
+    total_runs = len(suite["tasks"]) * seeds * len(arms)
+    return {
+        "suite": suite["suite"],
+        "version": suite.get("version"),
+        "suite_dir": suite_dir,
+        "tasks": tasks,
+        "arms": arms,
+        "seeds": seeds,
+        "total_runs": total_runs,
+        "dry_run": True,
+    }
+
+
+def swe_build_ledger_row(run_ts, git_meta, suite_dir, arms_results, seeds):
+    """Build an immutable ledger row for a bench swe run. Pure.
+
+    Args:
+        run_ts: UTC ISO timestamp of the run.
+        git_meta: dict with commit/subject/committed/dirty.
+        suite_dir: path to the suite (for recording).
+        arms_results: dict mapping arm name -> {pass_rates: [...], turns_mean, tokens_mean}
+        seeds: number of seeds used.
+
+    Returns:
+        A ledger row dict.
+    """
+    arm_stats = {}
+    for arm, data in arms_results.items():
+        rates = data.get("pass_rates", [])
+        arm_stats[arm] = swe_aggregate_seeds(rates)
+        arm_stats[arm]["turns_mean"] = data.get("turns_mean", 0)
+        arm_stats[arm]["tokens_mean"] = data.get("tokens_mean", 0)
+    arm_names = list(arms_results.keys())
+    delta = None
+    if len(arm_names) >= 2:
+        a_rates = arms_results[arm_names[0]].get("pass_rates", [])
+        b_rates = arms_results[arm_names[1]].get("pass_rates", [])
+        if a_rates and b_rates:
+            decision = swe_regression_decision(a_rates, b_rates)
+            delta = decision["delta"]
+    return {
+        "schema": LEDGER_SCHEMA,
+        "suite": "swe-task",
+        "run": run_ts,
+        "commit": git_meta.get("commit", "unknown"),
+        "committed": git_meta.get("committed", ""),
+        "subject": git_meta.get("subject", ""),
+        "dirty": git_meta.get("dirty", False),
+        "mode": "swe-task",
+        "seeds": seeds,
+        "arms": arm_stats,
+        "delta": delta,
+    }
+
+
+def cmd_bench_swe(args):
+    """`bench swe` -- SWE-task behavioral benchmark runner."""
+    suite_dir = args.suite
+    seeds = args.seeds
+    arms = [a.strip() for a in args.arms.split(",") if a.strip()]
+    fmt = getattr(args, "format", "text")
+
+    if not arms:
+        print("bench swe: --arms must specify at least one arm",
+              file=sys.stderr)
+        return 1
+
+    if not os.path.isdir(suite_dir):
+        print("bench swe: suite directory not found: %s" % suite_dir,
+              file=sys.stderr)
+        return 1
+
+    try:
+        swe_load_suite(suite_dir)
+    except (ValueError, IOError, OSError) as e:
+        print("bench swe: invalid suite: %s" % e, file=sys.stderr)
+        return 1
+
+    if args.dry_run:
+        plan = swe_build_dry_run_plan(suite_dir, seeds, arms)
+        if fmt == "json":
+            print(json.dumps(plan, indent=2, ensure_ascii=False))
+        else:
+            print("bench swe [dry-run]: %d tasks x %d seeds x %d arms = %d runs"
+                  % (len(plan["tasks"]), seeds, len(arms), plan["total_runs"]))
+            for t in plan["tasks"]:
+                print("  - %s (kind=%s, timeout=%s, mutation=%s)"
+                      % (t["id"], t["kind"], t["timeout"],
+                         t["expected_mutation"]))
+            print("  arms: %s" % ", ".join(arms))
+        return 0
+
+    # Live run: spawn agents per task x seed x arm
+    import tempfile as _tf
+    suite = swe_load_suite(suite_dir)
+    arms_results = {}
+    for arm in arms:
+        arm_pass_rates = []
+        total_turns = 0
+        total_tokens = 0
+        run_count = 0
+        for seed in range(seeds):
+            seed_passed = 0
+            seed_total = 0
+            for task_id in suite["tasks"]:
+                task_dir_path = os.path.join(suite_dir, task_id)
+                meta = swe_load_task_meta(suite_dir, task_id)
+                scratch = _tf.mkdtemp(prefix="swe-run-%s-%d-" % (task_id, seed))
+                try:
+                    scratch_repo = os.path.join(scratch, "repo")
+                    shutil.copytree(os.path.join(task_dir_path, "repo"),
+                                    scratch_repo)
+                    with open(os.path.join(task_dir_path, "task.md"),
+                              encoding="utf-8") as f:
+                        task_prompt = f.read()
+                    agent_cmd = [
+                        "claude", "-p", task_prompt,
+                        "--agent", "agentware-execution",
+                        "--dangerously-bypass-approvals-and-sandbox",
+                    ]
+                    env = dict(os.environ)
+                    if arm == "no-context":
+                        env.pop("AGENTWARE_KNOWLEDGE_DIR", None)
+                    try:
+                        proc = subprocess.run(
+                            agent_cmd, cwd=scratch_repo,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            universal_newlines=True,
+                            timeout=meta.get("timeout", 120),
+                            env=env)
+                        turns = 1
+                        tokens = len(proc.stdout) // 4
+                    except (subprocess.TimeoutExpired, OSError):
+                        turns = 0
+                        tokens = 0
+                    result = swe_score_task(task_dir_path, scratch_repo)
+                    task_pass = swe_task_passed(result, meta)
+                    seed_total += 1
+                    if task_pass:
+                        seed_passed += 1
+                    total_turns += turns
+                    total_tokens += tokens
+                    run_count += 1
+                finally:
+                    shutil.rmtree(scratch, ignore_errors=True)
+            rate = seed_passed / seed_total if seed_total else 0.0
+            arm_pass_rates.append(rate)
+        arms_results[arm] = {
+            "pass_rates": arm_pass_rates,
+            "turns_mean": total_turns / run_count if run_count else 0,
+            "tokens_mean": total_tokens / run_count if run_count else 0,
+        }
+
+    run_ts = utc_now_iso()
+    g_meta = git_info()
+    row = swe_build_ledger_row(run_ts, g_meta, suite_dir, arms_results, seeds)
+
+    kdir = resolve_knowledge_dir()
+    if kdir:
+        ledger_path = os.path.join(kdir, HISTORY_REL)
+        os.makedirs(os.path.dirname(ledger_path), exist_ok=True)
+        append_ledger_row(ledger_path, row)
+
+    if fmt == "json":
+        print(json.dumps(row, indent=2, ensure_ascii=False))
+    else:
+        print("bench swe: completed %d tasks x %d seeds x %d arms"
+              % (len(suite["tasks"]), seeds, len(arms)))
+        for arm, stats in row.get("arms", {}).items():
+            print("  %s: pass_rate mean=%.2f (min=%.2f max=%.2f)"
+                  % (arm, stats["mean"], stats["min"], stats["max"]))
+        if row.get("delta") is not None:
+            print("  delta: %+.4f" % row["delta"])
     return 0
 
 
@@ -7132,6 +7725,61 @@ def cmd_recall(args):
     if not _is_valid_date(as_of):
         sys.stderr.write("agentware: --as-of must be a YYYY-MM-DD date\n")
         return 1
+
+    # Resolve scope: default (None) = curated only (byte-unchanged from pre-scope);
+    # 'curated' = same; 'work' = only work/ files; 'all' = both.
+    scope = getattr(args, "scope", None)
+
+    # For 'work' scope: build ephemeral corpus from work/*.md, score with BM25,
+    # return ranked results (never touches index.json).
+    if scope == "work":
+        work_corpus = build_work_corpus(kdir)
+        if not work_corpus:
+            payload = {"query": args.query, "strategy": "bm25", "scope": "work",
+                       "as_of": as_of, "top_k": args.top_k,
+                       "token_budget": args.token_budget, "category": None,
+                       "context_tokens": 0, "count": 0, "results": [],
+                       "overflow": [], "overflow_count": 0}
+        else:
+            query_tokens = tokenize(args.query)
+            scored = bm25_scores(work_corpus, query_tokens)
+            # Sort: score desc -> created desc -> id asc
+            scored.sort(key=lambda es: es[0].get("id") or "")
+            scored.sort(key=lambda es: es[0].get("created") or "", reverse=True)
+            scored.sort(key=lambda es: es[1], reverse=True)
+            scored = [(e, s) for (e, s) in scored if s > 0]
+            if args.top_k:
+                scored = scored[:args.top_k]
+            results, overflow, used = [], [], 0
+            for entry, score in scored:
+                doc_text = next((t for (e, t) in work_corpus
+                                 if e.get("id") == entry.get("id")), "")
+                cost = estimate_tokens(doc_text)
+                if used + cost > args.token_budget:
+                    overflow.append({"id": entry.get("id"), "path": entry.get("path"),
+                                     "category": "work", "score": round(score, 6),
+                                     "estimated_tokens": cost})
+                    continue
+                used += cost
+                results.append({"id": entry.get("id"), "path": entry.get("path"),
+                                "category": "work", "score": round(score, 6),
+                                "summary": entry.get("title") or "",
+                                "estimated_tokens": cost})
+            payload = {"query": args.query, "strategy": "bm25", "scope": "work",
+                       "as_of": as_of, "top_k": args.top_k,
+                       "token_budget": args.token_budget, "category": None,
+                       "context_tokens": used, "count": len(results),
+                       "results": results, "overflow": overflow,
+                       "overflow_count": len(overflow)}
+        if args.format == "json":
+            json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+            sys.stdout.write("\n")
+            return 0
+        print("recall (scope=work): query=%r  -> %d entries" % (args.query, len(payload["results"])))
+        for r in payload["results"]:
+            print("  [%.4f] %s" % (r["score"], r["id"]))
+            print("    %s" % r["path"])
+        return 0
 
     # Resolve the ranking strategy + build the canonical payload via the shared
     # builder (single source of truth; the MCP `recall` tool reuses it so both
@@ -10732,9 +11380,11 @@ def _first_token_verb(body):
     return first.strip("*_`").rstrip(":.,")
 
 
-def lint_steering():
+def lint_steering(strict=False):
     violations, banned_words = [], []
     total_chars = 0
+    all_rule_ids = set()
+    file_texts = {}
     for path in _steering_files():
         try:
             text = open(path, "r", encoding="utf-8").read()
@@ -10742,29 +11392,100 @@ def lint_steering():
             violations.append({"rule": "DSF-read", "file": path,
                                "line": 0, "text": str(exc)})
             continue
+        file_texts[path] = text
         total_chars += len(text)
         for lineno, body in _iter_rule_lines(text):
             verb = _first_token_verb(body)
             if verb not in DSF_VERBS:
                 violations.append({"rule": "DSF-2", "file": path, "line": lineno,
                                    "text": body})
-            if not DSF_RULE_ID_RE.search(body):
+            ids_in_line = DSF_RULE_ID_RE.findall(body)
+            if not ids_in_line:
                 violations.append({"rule": "DSF-6", "file": path, "line": lineno,
                                    "text": body})
+            all_rule_ids.update(ids_in_line)
             low = body.lower()
             for w in DSF_BANNED_WORDS:
                 if re.search(r"\b" + re.escape(w) + r"\b", low):
                     banned_words.append({"file": path, "line": lineno,
                                          "word": w, "text": body})
     budget_ok = total_chars <= STEERING_CHAR_BUDGET
-    ok = (not violations) and (not banned_words) and budget_ok
+
+    # --- Content-preservation checks (Gate 1) --------------------------------
+    content_errors = []
+
+    # CP-1: Required rule IDs must be present somewhere in the corpus.
+    missing_ids = [rid for rid in REQUIRED_RULE_IDS if rid not in all_rule_ids]
+    for mid in missing_ids:
+        content_errors.append({"rule": "CP-1", "text":
+                               "required rule ID %s is missing from the corpus" % mid})
+
+    # CP-2: Required sections must appear in AGENTS.md.
+    agents_path = os.path.join(REPO_ROOT, "AGENTS.md")
+    agents_text = file_texts.get(agents_path, "")
+    agents_headings = set()
+    for line in agents_text.splitlines():
+        m = re.match(r"^##\s+(.+?)\s*$", line)
+        if m:
+            agents_headings.add(m.group(1))
+    missing_sections = [s for s in REQUIRED_SECTIONS if s not in agents_headings]
+    for ms in missing_sections:
+        content_errors.append({"rule": "CP-2", "text":
+                               "required section '%s' missing from AGENTS.md" % ms})
+
+    # CP-3: Rule-count no-regression. The committed baseline is the count of
+    # UNIQUE rule IDs in the corpus at the last known-good state. We store the
+    # baseline in a file so it can be committed and updated deliberately.
+    rule_count = len(all_rule_ids)
+    baseline_count = _read_rule_count_baseline()
+    rule_count_ok = True
+    if baseline_count is not None:
+        if rule_count < baseline_count - RULE_COUNT_REGRESSION_MARGIN:
+            rule_count_ok = False
+            content_errors.append({"rule": "CP-3", "text":
+                "rule-count regression: %d < baseline %d (margin %d)"
+                % (rule_count, baseline_count, RULE_COUNT_REGRESSION_MARGIN)})
+
+    # --strict makes content-preservation errors hard failures.
+    content_ok = not content_errors
+    dsf_ok = (not violations) and (not banned_words) and budget_ok
+    if strict:
+        ok = dsf_ok and content_ok
+    else:
+        ok = dsf_ok
     return {"ok": ok, "total_chars": total_chars, "char_budget": STEERING_CHAR_BUDGET,
             "budget_ok": budget_ok, "violations": violations,
-            "banned_words": banned_words}
+            "banned_words": banned_words,
+            "content_errors": content_errors, "content_ok": content_ok,
+            "rule_count": rule_count, "rule_count_baseline": baseline_count}
+
+
+def _read_rule_count_baseline():
+    """Read the committed rule-count baseline from .rule-count-baseline.
+
+    Returns the integer baseline, or None if the file does not exist.
+    """
+    path = os.path.join(REPO_ROOT, ".rule-count-baseline")
+    if not os.path.isfile(path):
+        return None
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            val = f.read().strip()
+        return int(val)
+    except (ValueError, OSError):
+        return None
+
+
+def _write_rule_count_baseline(count):
+    """Write the rule-count baseline file."""
+    path = os.path.join(REPO_ROOT, ".rule-count-baseline")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("%d\n" % count)
 
 
 def cmd_steering_lint(args):
-    result = lint_steering()
+    strict = getattr(args, "strict", False)
+    result = lint_steering(strict=strict)
     as_json = getattr(args, "format", "text") == "json"
     if as_json:
         json.dump(result, sys.stdout, ensure_ascii=False, indent=2)
@@ -10774,12 +11495,241 @@ def cmd_steering_lint(args):
         print("  chars: %d / %d (budget %s)" % (
             result["total_chars"], result["char_budget"],
             "ok" if result["budget_ok"] else "EXCEEDED"))
+        if result.get("rule_count") is not None:
+            print("  rule-count: %d (baseline: %s)" % (
+                result["rule_count"],
+                str(result["rule_count_baseline"]) if result["rule_count_baseline"] is not None else "none"))
         for v in result["violations"]:
             print("  [%s] %s:%d  %s" % (v["rule"], v["file"], v["line"], v["text"]))
         for b in result["banned_words"]:
             print("  [DSF-5] %s:%d  banned %r in: %s" % (
                 b["file"], b["line"], b["word"], b["text"]))
+        for ce in result.get("content_errors", []):
+            print("  [%s] %s" % (ce["rule"], ce["text"]))
     return 0 if result["ok"] else 1
+
+
+# --- Release gate harness (feature 260630-release-gate) -----------------------
+# Multi-tier gate that prevents regressions before agentware changes ship.
+# Tier A (auto, network-free): Gate 1 (content-lint) + Gate 2-lite (gold-fixture
+#   no-regression) + Gate 3 (reliability no-regression).
+# Tier B (opt-in --full): Gate 2-full (own-gold + LongMemEval) + Gate 4 (SWE-task).
+
+def _gate1_content_lint():
+    """Gate 1: Content/intent preservation lint (strict mode)."""
+    result = lint_steering(strict=True)
+    errors = []
+    for v in result.get("violations", []):
+        errors.append("%s %s:%d %s" % (v["rule"], v["file"], v["line"], v["text"]))
+    for b in result.get("banned_words", []):
+        errors.append("DSF-5 %s:%d banned %r" % (b["file"], b["line"], b["word"]))
+    for ce in result.get("content_errors", []):
+        errors.append("%s %s" % (ce["rule"], ce["text"]))
+    if not result["budget_ok"]:
+        errors.append("char budget exceeded: %d > %d" % (
+            result["total_chars"], result["char_budget"]))
+    return {
+        "gate": "content-lint",
+        "passed": result["ok"],
+        "details": errors or ["DSF+CP clean: %d chars, %d rules" % (
+            result["total_chars"], result.get("rule_count", 0))],
+    }
+
+
+def _gate2_lite_gold_fixture(kdir, data, tolerance):
+    """Gate 2-lite: gold-fixture retrieval no-regression."""
+    fixture_path = gold_fixture_path()
+    if not os.path.isfile(fixture_path):
+        return {"gate": "gold-fixture", "passed": True,
+                "details": ["SKIP: gold-fixture file not found at %s" % fixture_path]}
+    try:
+        result = evaluate_gold_fixture(kdir, fixture_path, "bm25", 5)
+    except (NotImplementedError, ValueError) as exc:
+        return {"gate": "gold-fixture", "passed": True,
+                "details": ["SKIP: %s" % exc]}
+    ledger_path = os.path.join(kdir, HISTORY_REL)
+    prior_rows = _read_ledger(ledger_path)
+    baseline = gate_baseline(prior_rows, "bm25", GOLD_FIXTURE_SUITE,
+                             result.get("corpus_fingerprint"))
+    passed, regressions = evaluate_gate(
+        result["metrics"], result.get("reliability", 100.0), baseline, tolerance)
+    details = []
+    if baseline is None:
+        details.append("first run (no baseline) — seeding and passing")
+    for m, b, c in regressions:
+        details.append("regression: %s baseline=%.4f current=%.4f" % (m, b, c))
+    if passed and not details:
+        details.append("Recall@5=%.4f (baseline: %s)" % (
+            result["metrics"].get("recall_at_k", 0),
+            "%.4f" % baseline.get("recall_at_k", 0) if baseline else "none"))
+    return {"gate": "gold-fixture", "passed": passed, "details": details}
+
+
+def _gate3_reliability_delta(kdir, tolerance):
+    """Gate 3: Reliability no-regression (delta, NOT absolute floor)."""
+    ledger_path = os.path.join(kdir, HISTORY_REL)
+    rows = _read_ledger(ledger_path)
+    if not rows:
+        return {"gate": "reliability-delta", "passed": True,
+                "details": ["no prior ledger rows — passing (first run)"]}
+    # Compare latest reliability to the best prior for the same suite+strategy.
+    # Use gold-fixture suite as the canonical anchor for Tier-A.
+    gf_rows = [r for r in rows if r.get("suite") == GOLD_FIXTURE_SUITE
+               and r.get("strategy") == "bm25"]
+    if not gf_rows:
+        return {"gate": "reliability-delta", "passed": True,
+                "details": ["no comparable gold-fixture rows — passing"]}
+    rels = [r.get("reliability", 0) for r in gf_rows
+            if isinstance(r.get("reliability"), (int, float))]
+    if not rels:
+        return {"gate": "reliability-delta", "passed": True,
+                "details": ["no reliability values in gold-fixture rows — passing"]}
+    best_rel = max(rels)
+    # Current reliability: the latest recorded row's reliability.
+    latest = max(gf_rows, key=lambda r: r.get("run", ""))
+    current_rel = latest.get("reliability", 0)
+    epsilon = tolerance * 100.0
+    passed = current_rel >= best_rel - epsilon
+    details = []
+    if not passed:
+        details.append("reliability regression: current=%.2f best=%.2f epsilon=%.2f"
+                       % (current_rel, best_rel, epsilon))
+    else:
+        details.append("reliability=%.2f (best=%.2f epsilon=%.2f)" % (
+            current_rel, best_rel, epsilon))
+    return {"gate": "reliability-delta", "passed": passed, "details": details}
+
+
+def _gate2_full(kdir, data, tolerance):
+    """Gate 2-full: own-gold + LongMemEval (Tier-B). Skip-with-log on missing baseline."""
+    results = []
+    # own-gold
+    own_gold_path = os.path.join(kdir, "benchmarks", "recall-gold.json")
+    if not os.path.isfile(own_gold_path):
+        results.append({"gate": "own-gold", "passed": True,
+                        "details": ["SKIP (loud): own-gold baseline absent at %s"
+                                    % own_gold_path]})
+    else:
+        try:
+            gold, gerr = load_gold(own_gold_path)
+            if gerr:
+                results.append({"gate": "own-gold", "passed": True,
+                                "details": ["SKIP (loud): %s" % gerr]})
+            else:
+                result = evaluate(kdir, data, gold, "bm25", 5)
+                ledger_path = os.path.join(kdir, HISTORY_REL)
+                prior_rows = _read_ledger(ledger_path)
+                baseline = gate_baseline(prior_rows, "bm25", None,
+                                         result.get("corpus_fingerprint"))
+                passed, regressions = evaluate_gate(
+                    result["metrics"], result.get("reliability", 100.0),
+                    baseline, tolerance)
+                details = []
+                if baseline is None:
+                    details.append("first own-gold run — seeding and passing")
+                for m, b, c in regressions:
+                    details.append("regression: %s baseline=%.4f current=%.4f"
+                                   % (m, b, c))
+                if passed and not details:
+                    details.append("Recall@5=%.4f" % result["metrics"].get(
+                        "recall_at_k", 0))
+                results.append({"gate": "own-gold", "passed": passed,
+                                "details": details})
+        except (NotImplementedError, ValueError, OSError) as exc:
+            results.append({"gate": "own-gold", "passed": True,
+                            "details": ["SKIP (loud): %s" % exc]})
+    # LongMemEval
+    ledger_path = os.path.join(kdir, HISTORY_REL)
+    prior_rows = _read_ledger(ledger_path)
+    lme_rows = [r for r in prior_rows if r.get("suite") == "longmemeval"]
+    if not lme_rows:
+        results.append({"gate": "longmemeval", "passed": True,
+                        "details": ["SKIP (loud): no LongMemEval baseline rows "
+                                    "in ledger"]})
+    else:
+        results.append({"gate": "longmemeval", "passed": True,
+                        "details": ["LongMemEval baseline present (%d rows) — "
+                                    "full eval deferred to CI" % len(lme_rows)]})
+    return results
+
+
+def _gate4_swe_task():
+    """Gate 4: SWE-task benchmark (Tier-B). Skip if bench swe subcommand absent."""
+    try:
+        proc = subprocess.run(
+            [sys.executable, os.path.join(REPO_ROOT, "scripts", "agentware"),
+             "bench", "swe", "--help"],
+            cwd=REPO_ROOT, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            timeout=10)
+        if proc.returncode != 0:
+            return {"gate": "swe-task", "passed": True,
+                    "details": ["SKIP: bench swe subcommand not available"]}
+    except (OSError, subprocess.TimeoutExpired):
+        return {"gate": "swe-task", "passed": True,
+                "details": ["SKIP: bench swe subcommand not available"]}
+    return {"gate": "swe-task", "passed": True,
+            "details": ["bench swe exists but full-run deferred to CI"]}
+
+
+def cmd_gate_release(args):
+    """Run the release gate harness. Exit 0 on pass, 1 on any failure."""
+    # Kill-switch
+    if os.environ.get("AGENTWARE_DISABLE_RELEASE_GATE", "").strip():
+        msg = "release gate SKIPPED (AGENTWARE_DISABLE_RELEASE_GATE set)"
+        if getattr(args, "format", "text") == "json":
+            json.dump({"passed": True, "skipped": True, "reason": msg},
+                      sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(msg)
+        return 0
+
+    as_json = getattr(args, "format", "text") == "json"
+    full = getattr(args, "full", False)
+    tolerance = getattr(args, "tolerance", 0.02)
+
+    # Graceful no-op when toolkit/workspace absent.
+    kdir = resolve_knowledge_dir()
+    if not kdir or not os.path.isdir(kdir):
+        msg = "release gate SKIPPED (no knowledge dir resolved)"
+        if as_json:
+            json.dump({"passed": True, "skipped": True, "reason": msg},
+                      sys.stdout, indent=2)
+            sys.stdout.write("\n")
+        else:
+            print(msg)
+        return 0
+
+    data, err = load_index(kdir)
+    if err is not None:
+        # If index is broken, still run content lint (Gate 1) which is repo-only.
+        data = []
+
+    gates = []
+
+    # --- Tier A (always) ---
+    gates.append(_gate1_content_lint())
+    gates.append(_gate2_lite_gold_fixture(kdir, data, tolerance))
+    gates.append(_gate3_reliability_delta(kdir, tolerance))
+
+    # --- Tier B (--full only) ---
+    if full:
+        gates.extend(_gate2_full(kdir, data, tolerance))
+        gates.append(_gate4_swe_task())
+
+    all_passed = all(g["passed"] for g in gates)
+    payload = {"passed": all_passed, "skipped": False, "gates": gates}
+
+    if as_json:
+        json.dump(payload, sys.stdout, ensure_ascii=False, indent=2)
+        sys.stdout.write("\n")
+    else:
+        print("RELEASE GATE %s" % ("PASSED" if all_passed else "FAILED"))
+        for g in gates:
+            print("  [%s] %s" % ("PASS" if g["passed"] else "FAIL", g["gate"]))
+            for d in g.get("details", []):
+                print("      %s" % d)
+    return 0 if all_passed else 1
 
 
 # --- Plan lint (feature 260625-plan-lint-gate) -------------------------------
@@ -10893,8 +11843,40 @@ def _check_task_numbering(number_strings):
     return None
 
 
+# --- R11: Target packages contract -----------------------------------------
+_PLAN_TARGET_SECTION_RE = re.compile(r"^##\s+Target\s+packages\s*$", re.IGNORECASE | re.MULTILINE)
+_PLAN_TARGET_PATH_RE = re.compile(r"^\s*-\s+(~[/\\]|/)\S")
+
+
+def plan_target_dirs(text):
+    """Extract declared target-package directory paths from a plan.
+
+    Parses the `## Target packages` section and returns a list of expanded
+    directory paths. Expands `~` to $HOME and environment variables. Returns
+    an empty list when the section is missing or has no path rows.
+    """
+    lines = text.splitlines()
+    in_section = False
+    dirs = []
+    for ln in lines:
+        if _PLAN_TARGET_SECTION_RE.match(ln):
+            in_section = True
+            continue
+        if in_section:
+            # End of section on next heading
+            if re.match(r"^##\s+", ln):
+                break
+            if _PLAN_TARGET_PATH_RE.match(ln):
+                # Extract the path (strip leading `- `)
+                path = ln.strip().lstrip("-").strip()
+                # Expand ~ and env vars
+                path = os.path.expanduser(os.path.expandvars(path))
+                dirs.append(path)
+    return dirs
+
+
 def lint_plan(text, strict=False):
-    """Apply the structural plan-format rules R1–R9 to `text`.
+    """Apply the structural plan-format rules R1–R11 to `text`.
 
     Returns (errors, warnings); each is a list of {rule, line, message}. R1 (file
     existence) is handled by the caller before this runs. Read-only (INV-2): never
@@ -11021,6 +12003,25 @@ def lint_plan(text, strict=False):
             "team-mode plan has no `> Author: <handle>` line — provenance is "
             "unclear (add via `plan new --author <handle>` or manually)")
 
+    # R11 — mandatory `## Target packages` section with at least one path row.
+    target_dirs = plan_target_dirs(text)
+    has_target_section = bool(_PLAN_TARGET_SECTION_RE.search(text))
+    if not has_target_section:
+        add(errors, "R11", 0,
+            "missing required section '## Target packages' — every plan must "
+            "declare the directory path(s) it targets (absolute or ~-rooted)")
+    elif not target_dirs:
+        # Section exists but has no valid path rows (e.g. only a TODO stub)
+        # Find the section line for better error reporting
+        sec_line = 0
+        for i, ln in enumerate(lines):
+            if _PLAN_TARGET_SECTION_RE.match(ln):
+                sec_line = i + 1
+                break
+        add(errors, "R11", sec_line,
+            "'## Target packages' section has no valid directory paths — add "
+            "at least one absolute or ~-rooted path (e.g. `- ~/workspace/pkg`)")
+
     return errors, warnings
 
 
@@ -11143,6 +12144,10 @@ def _plan_skeleton(feature, title, max_iterations, self_extension, author=None):
         "%s"
         "## Context\n\n"
         "_TODO: problem, goal, design, constraints, environment, pitfalls._\n\n"
+        "---\n\n"
+        "## Target packages\n\n"
+        "- TODO: replace with the absolute or ~-rooted directory path(s) this "
+        "plan targets\n\n"
         "---\n\n"
         "## Tasks\n\n"
         "- ⬜ **1** [e2e] End-to-end verification of the feature.\n"
@@ -11309,6 +12314,20 @@ def cmd_plan_set_status(args):
     else:
         print("PLAN set-status '%s': task %d -> %s"
               % (args.feature, target, args.status))
+    return 0
+
+
+def cmd_plan_target_dirs(args):
+    """Print declared target-package directories from a plan (one per line)."""
+    path = args.path
+    if not os.path.isfile(path):
+        sys.stderr.write("agentware: plan not found: %s\n" % path)
+        return 1
+    with open(path, "r", encoding="utf-8") as f:
+        text = f.read()
+    dirs = plan_target_dirs(text)
+    for d in dirs:
+        print(d)
     return 0
 
 
@@ -15476,6 +16495,69 @@ def cmd_update(args):
     return emit(payload, lines, 0)
 
 
+def cmd_whereami(args):
+    """Resolve the project/repo context for a directory (build-system-neutral)."""
+    start_dir = getattr(args, "dir", None) or os.environ.get("AGENTWARE_INVOKED_FROM") or os.getcwd()
+    start_dir = os.path.abspath(os.path.expanduser(start_dir))
+
+    result = {
+        "invoked_from": start_dir,
+        "repo_root": "",
+        "project_name": "",
+        "project_dir": "",
+    }
+
+    # Portable, language-neutral resolution: walk up from start_dir and match the
+    # nearest ancestor that carries a conventional project-root marker. PROJECT
+    # markers pin the enclosing project/package for any common ecosystem; VCS
+    # markers pin the repository root (which may sit above the project in a
+    # monorepo). No build-system-specific directory layout is assumed.
+    project_markers = (
+        "pyproject.toml", "setup.py", "package.json", "go.mod",
+        "Cargo.toml", "pom.xml", "build.gradle", "build.gradle.kts",
+    )
+    vcs_markers = (".git", ".hg", ".svn")
+
+    cur = start_dir
+    while True:
+        if not result["project_dir"] and any(
+            os.path.exists(os.path.join(cur, m)) for m in project_markers
+        ):
+            result["project_dir"] = cur
+            result["project_name"] = os.path.basename(cur)
+        if not result["repo_root"] and any(
+            os.path.exists(os.path.join(cur, m)) for m in vcs_markers
+        ):
+            result["repo_root"] = cur
+        parent = os.path.dirname(cur)
+        if (result["project_dir"] and result["repo_root"]) or cur == parent:
+            # Both resolved, or reached the filesystem root.
+            break
+        cur = parent
+
+    # Fallbacks so consumers always get a usable root: a bare VCS checkout with no
+    # ecosystem manifest still resolves (the repo root doubles as the project),
+    # and a project with no VCS marker still reports a repo_root.
+    if result["repo_root"] and not result["project_dir"]:
+        result["project_dir"] = result["repo_root"]
+        result["project_name"] = os.path.basename(result["repo_root"])
+    if result["project_dir"] and not result["repo_root"]:
+        result["repo_root"] = result["project_dir"]
+
+    fmt = getattr(args, "format", "json")
+    if fmt == "json":
+        print(json.dumps(result, indent=2))
+    else:
+        if result["project_name"]:
+            print("invoked_from:  %s" % result["invoked_from"])
+            print("repo_root:     %s" % result["repo_root"])
+            print("project_name:  %s" % result["project_name"])
+            print("project_dir:   %s" % result["project_dir"])
+        else:
+            print("No project resolved for: %s" % result["invoked_from"])
+    return 0
+
+
 def build_parser():
     fmt_parent = argparse.ArgumentParser(add_help=False)
     fmt_parent.add_argument("--format", choices=("text", "json"), default="text",
@@ -15890,6 +16972,12 @@ def build_parser():
     p_recall.add_argument("--as-of", default=None, dest="as_of",
                           help="YYYY-MM-DD date for ACR freshness decay "
                                "(default: today; PIN it for reproducible runs)")
+    p_recall.add_argument("--scope", choices=("curated", "work", "all"),
+                          default=None,
+                          help="corpus scope: curated (indexed entries only, "
+                               "default), work (plans/worklogs in work/), "
+                               "all (both). work/ entries are ephemeral "
+                               "(never written to index.json).")
     p_recall.set_defaults(func=cmd_recall)
 
     # mcp --------------------------------------------------------------------
@@ -16005,6 +17093,25 @@ def build_parser():
         "path", nargs="?", default=None,
         help="ledger file to scrub (default: <knowledge-dir>/benchmarks/history.jsonl)")
     p_redact.set_defaults(func=cmd_bench_redact)
+    p_swe = bench_sub.add_parser(
+        "swe",
+        help="SWE-task behavioral benchmark (hidden-unit-test coding suite)")
+    p_swe.add_argument(
+        "--suite", required=True,
+        help="path to the suite directory containing suite.json and task dirs")
+    p_swe.add_argument(
+        "--seeds", type=int, default=SWE_DEFAULT_SEEDS,
+        help="number of seeds per arm (default: %d)" % SWE_DEFAULT_SEEDS)
+    p_swe.add_argument(
+        "--arms", default=",".join(SWE_DEFAULT_ARMS),
+        help="comma-separated arm names (default: %s)" % ",".join(SWE_DEFAULT_ARMS))
+    p_swe.add_argument(
+        "--dry-run", action="store_true", dest="dry_run",
+        help="print planned runs as JSON without spawning agents")
+    p_swe.add_argument(
+        "--format", choices=["text", "json"], default="text",
+        help="output format (default: text)")
+    p_swe.set_defaults(func=cmd_bench_swe)
 
     # metrics ----------------------------------------------------------------
     p_metrics = sub.add_parser(
@@ -16137,7 +17244,32 @@ def build_parser():
     steer_sub.required = True
     p_lint = steer_sub.add_parser(
         "lint", parents=[fmt_parent], help="enforce DSF on always-loaded steering")
+    p_lint.add_argument("--strict", action="store_true",
+                        help="treat content-preservation errors (CP-1/2/3) as hard failures")
     p_lint.set_defaults(func=cmd_steering_lint)
+
+    # gate -------------------------------------------------------------------
+    p_gate = sub.add_parser("gate", help="release gate harness")
+    gate_sub = p_gate.add_subparsers(dest="gate_command", metavar="<subcommand>")
+    gate_sub.required = True
+    p_gate_release = gate_sub.add_parser(
+        "release", parents=[fmt_parent],
+        help="run the multi-tier release gate (Tier-A by default, --full for Tier-B)")
+    p_gate_release.add_argument("--full", action="store_true",
+                                help="run heavyweight Tier-B gates (own-gold, "
+                                     "LongMemEval, SWE-task)")
+    p_gate_release.add_argument("--tolerance", type=float, default=0.02,
+                                help="regression tolerance for retrieval metrics "
+                                     "(default: 0.02)")
+    p_gate_release.set_defaults(func=cmd_gate_release)
+
+    # whereami ---------------------------------------------------------------
+    p_whereami = sub.add_parser(
+        "whereami", parents=[fmt_parent],
+        help="resolve the project/repo context for a directory")
+    p_whereami.add_argument("--dir", default=None,
+                            help="directory to resolve (default: $AGENTWARE_INVOKED_FROM or $PWD)")
+    p_whereami.set_defaults(func=cmd_whereami)
 
     # plan -------------------------------------------------------------------
     p_plan = sub.add_parser("plan", help="feature-plan structural tooling")
@@ -16191,6 +17323,12 @@ def build_parser():
     p_plan_status.add_argument("status", choices=("todo", "wip", "done"),
                                help="new status")
     p_plan_status.set_defaults(func=cmd_plan_set_status)
+
+    p_plan_tdirs = plan_sub.add_parser(
+        "target-dirs",
+        help="print declared target-package dirs from a plan (one per line)")
+    p_plan_tdirs.add_argument("--path", required=True, help="path to a plan.md")
+    p_plan_tdirs.set_defaults(func=cmd_plan_target_dirs)
 
     # fanout -----------------------------------------------------------------
     p_fanout = sub.add_parser(

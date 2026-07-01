@@ -1,0 +1,7 @@
+{
+  "id": "efficiency-sort",
+  "kind": "efficiency",
+  "timeout": 120,
+  "expected_mutation": true,
+  "description": "Fix a quadratic top-k implementation to run in O(n log k) or better."
+}

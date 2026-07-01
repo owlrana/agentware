@@ -1,0 +1,12 @@
+{
+  "version": "1.0",
+  "suite": "swe-task",
+  "description": "Frozen hidden-unit-test coding suite for SWE-task behavioral benchmark.",
+  "tasks": [
+    "fix-off-by-one",
+    "fix-null-guard",
+    "feature-csv-parser",
+    "efficiency-sort",
+    "abstain-correct"
+  ]
+}

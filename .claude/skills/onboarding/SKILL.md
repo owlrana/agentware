@@ -706,8 +706,8 @@ resolve.
    **If `$AW_CLI` == `claude` (default):**
    ```
    # >>> agentware aliases >>>
-   alias PLAN_AW='(cd "$AW_REPO" && claude --agent agentware-planner --dangerously-skip-permissions)'
-   alias WORK_AW='(cd "$AW_REPO" && claude --agent agentware-execution --dangerously-skip-permissions)'
+   alias PLAN_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && claude --agent agentware-planner --dangerously-skip-permissions)'
+   alias WORK_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && claude --agent agentware-execution --dangerously-skip-permissions)'
    # <<< agentware aliases <<<
    ```
 
@@ -719,8 +719,8 @@ resolve.
    skip-permissions):
    ```
    # >>> agentware aliases >>>
-   alias PLAN_AW='(cd "$AW_REPO" && codex --sandbox read-only "Read .claude/agents/agentware-planner.md and fully adopt that persona. You are the agentware PLANNER: design and write plans only, NEVER execute them.")'
-   alias WORK_AW='(cd "$AW_REPO" && codex --dangerously-bypass-approvals-and-sandbox "Read .claude/agents/agentware-execution.md and fully adopt that persona. You are the agentware EXECUTION agent: implement the next plan task, verify it, and log progress.")'
+   alias PLAN_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && codex --sandbox read-only "Read .claude/agents/agentware-planner.md and fully adopt that persona. You are the agentware PLANNER: design and write plans only, NEVER execute them.")'
+   alias WORK_AW='(export AGENTWARE_INVOKED_FROM="$PWD"; echo "▶ agentware: $(cd "$AW_REPO" && scripts/agentware whereami --dir "$AGENTWARE_INVOKED_FROM" 2>/dev/null | python3 -c '"'"'import sys,json;d=json.load(sys.stdin);print(d.get("project_name","?")+" @ "+d.get("project_dir","unknown"))'"'"' 2>/dev/null || echo "no project resolved")"; cd "$AW_REPO" && codex --dangerously-bypass-approvals-and-sandbox "Read .claude/agents/agentware-execution.md and fully adopt that persona. You are the agentware EXECUTION agent: implement the next plan task, verify it, and log progress.")'
    # <<< agentware aliases <<<
    ```
    Write the LITERAL absolute path (e.g. `/Users/you/agentware`), not the

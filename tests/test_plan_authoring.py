@@ -89,7 +89,21 @@ class PlanAuthoringTestCase(unittest.TestCase):
 
     def new_plan(self, feature="demo", title="Demo Feature", *extra):
         argv = ["plan", "new", feature, "--title", title] + list(extra)
-        return self.run_plan(argv)
+        result = self.run_plan(argv)
+        # The emitter seeds a `## Target packages` stub with a TODO path that
+        # intentionally FAILS R11 (forces the planner to fill it). For tests
+        # that subsequently call add-task/set-status (which lint-check before
+        # editing), patch the stub to a valid path so the plan passes lint.
+        path = self.plan_path(feature)
+        if os.path.isfile(path):
+            text = self.read_plan(feature)
+            text = text.replace(
+                "- TODO: replace with the absolute or ~-rooted directory "
+                "path(s) this plan targets",
+                "- /tmp/test-target-dir")
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(text)
+        return result
 
     # --- (a) plan new: skeleton + promise + mandatory seed pair -------------
     def test_new_writes_skeleton_with_sections_and_promise(self):

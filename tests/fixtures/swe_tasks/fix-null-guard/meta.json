@@ -1,0 +1,7 @@
+{
+  "id": "fix-null-guard",
+  "kind": "fix",
+  "timeout": 120,
+  "expected_mutation": true,
+  "description": "Add missing None guard to a user lookup function."
+}

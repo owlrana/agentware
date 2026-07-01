@@ -792,6 +792,45 @@ run_pre_hooks() {
       echo "Error: [pre-hook] plan lint failed — plan.md violates the structural contract (markers must be '- ⬜ **N** …'). Fix it (see the rule output above) before the run."
       exit 1
     fi
+
+    # Target-packages existence gate (R11 contract enforcement).
+    # Parse declared target dirs from the plan and assert each exists on disk.
+    # Hard-abort before phase 1 when any is missing (pre_hook_abort outcome).
+    # Kill-switch: AGENTWARE_DISABLE_TARGET_GATE=1 skips the check entirely.
+    if [[ -n "${AGENTWARE_DISABLE_TARGET_GATE:-}" ]]; then
+      log "[pre-hook] AGENTWARE_DISABLE_TARGET_GATE set — skipping target-packages existence gate."
+    else
+      local target_dirs
+      target_dirs=$(scripts/agentware plan target-dirs --path "$DOCS_DIR/plan.md" 2>/dev/null || true)
+      if [[ -n "$target_dirs" ]]; then
+        local missing=()
+        while IFS= read -r dir; do
+          if [[ ! -d "$dir" ]]; then
+            missing+=("$dir")
+          fi
+        done <<< "$target_dirs"
+        if [[ ${#missing[@]} -gt 0 ]]; then
+          echo "Error: [pre-hook] target-packages existence gate FAILED."
+          echo "  The plan declares target directories that do NOT exist:"
+          for m in "${missing[@]}"; do
+            echo "    ✗ $m"
+            # Suggest nearby candidates
+            local pkg_name
+            pkg_name=$(basename "$m")
+            local candidates
+            candidates=$(find ~/workspace -maxdepth 5 -name "$pkg_name" -type d 2>/dev/null | head -5)
+            if [[ -n "$candidates" ]]; then
+              echo "      Nearby candidates:"
+              while IFS= read -r c; do
+                echo "        → $c"
+              done <<< "$candidates"
+            fi
+          done
+          echo "  Fix the plan's '## Target packages' section or cd to the correct workspace."
+          exit 1
+        fi
+      fi
+    fi
   fi
 
   # KB pull cadence (feature 260625-kb-git-sync, Task 3.1; default-ON flip
@@ -842,6 +881,22 @@ run_post_hooks() {
   if ! scripts/agentware steering lint; then
     echo "Error: [post-hook] steering lint failed after execution — steering drifted out of DSF."
     exit 1
+  fi
+
+  # Release gate (Tier-A): fires only when the run's diff touched package files.
+  # Honors AGENTWARE_DISABLE_RELEASE_GATE kill-switch.
+  if [[ -z "${AGENTWARE_DISABLE_RELEASE_GATE:-}" ]]; then
+    local _pkg_diff=""
+    _pkg_diff="$(git diff --name-only HEAD 2>/dev/null || true)"
+    _pkg_diff="${_pkg_diff}$(git diff --name-only --cached 2>/dev/null || true)"
+    _pkg_diff="${_pkg_diff}$(git status --porcelain 2>/dev/null | grep -E '^\s*[MADRCU]' | sed 's/^...//' || true)"
+    if echo "$_pkg_diff" | grep -qE '(^|\s)(AGENTS\.md|scripts/|\.claude/|steering/|agentware\.sh)'; then
+      log "[post-hook] scripts/agentware gate release (package files changed)"
+      if ! scripts/agentware gate release; then
+        echo "Error: [post-hook] release gate FAILED — package regression detected."
+        exit 1
+      fi
+    fi
   fi
 
   log "[post-hook] scripts/agentware worklog scan (zero-knowledge-loss gate)"
@@ -1079,7 +1134,7 @@ run_agent() {
           --log-dir "${KDIR:+$KDIR/logs}" --feature "$FEATURE_NAME" --prompt "$prompt"
   else
     CI=true npm_config_yes=true HOMEBREW_NO_AUTO_UPDATE=1 \
-      "$R_CLI" -p --agent "$AGENT" "$CLAUDE_SKIP_PERMS" "${model_flag[@]}" "$prompt"
+      "$R_CLI" -p --agent "$AGENT" "$CLAUDE_SKIP_PERMS" "${model_flag[@]}" "$prompt" < /dev/null
   fi
 }
 
@@ -1280,6 +1335,13 @@ prev_remaining=$(open_markers)
 NOPROGRESS_LIMIT="${AGENTWARE_NOPROGRESS_LIMIT:-3}"
 noprogress_streak=0
 
+# ---- SAFETY: blocker-halt seam (invocation-cwd-context feature) ----
+# When an agent emits AW_BLOCKER_HALT (e.g. because it cannot resolve which
+# checkout to target and is in loop mode), the loop exits cleanly with a
+# distinct terminal outcome (blocked_on_ambiguity) BEFORE re-spawning. The
+# agent writes `> BLOCKER:` to the worklog and emits this token on stdout.
+AW_BLOCKER_HALT="AW_BLOCKER_HALT"
+
 # Stage propagation (Task 7): main-loop spawns are attributed to loop-main.
 export AGENTWARE_STAGE="loop-main"
 
@@ -1297,8 +1359,24 @@ for i in $(seq 1 "$MAX_ITERATIONS"); do
   # (Task 4) can tell whether this iteration actually moved anything.
   np_sig_before="$(progress_signature)"
   it_t0=$(date +%s)
-  run_agent "$main_role" "$CURRENT_PROMPT" || true
+  # Capture iteration output to check for blocker-halt and progress signals.
+  if [[ -t 1 ]] || { : 2>/dev/null >/dev/tty; } 2>/dev/null; then
+    iter_output=$(run_agent "$main_role" "$CURRENT_PROMPT" 2>&1 | tee /dev/tty) || true
+  else
+    iter_output=$(run_agent "$main_role" "$CURRENT_PROMPT" 2>&1) || true
+  fi
   it_wall=$(( $(date +%s) - it_t0 ))
+
+  # ---- SAFETY: blocker-halt check (invocation-cwd-context feature) ----
+  # If the agent emitted AW_BLOCKER_HALT, it means the agent cannot resolve which
+  # checkout to target (ambiguous invocation context in loop mode). Exit cleanly
+  # with a distinct terminal outcome BEFORE re-spawning.
+  if echo "$iter_output" | grep -q "$AW_BLOCKER_HALT"; then
+    log "⚠ Agent emitted AW_BLOCKER_HALT — blocked on ambiguity. Exiting cleanly."
+    LOOP_OUTCOME="blocked_on_ambiguity"
+    notify "blocked on ambiguity (AW_BLOCKER_HALT)"
+    exit 0
+  fi
 
   # ---- SAFETY: no-progress circuit breaker + opt-in cloud fallback (Task 4) ----
   # Only the normal task-execution path is policed; the PROMOTE self-heal (main_role
